@@ -163,6 +163,24 @@ HTML = r"""<!doctype html>
   }
   .pmeta .pct { font-variant-numeric: tabular-nums; flex: none; }
 
+  /* Follow-on step */
+  .next {
+    display: none; margin-top: 1.25rem; padding-top: 1.15rem;
+    border-top: 1px solid var(--border);
+  }
+  .next.vis { display: block; }
+  .next-h { font-size: .9rem; font-weight: 600; margin-bottom: .3rem; }
+  .next-p { font-size: .8rem; color: var(--muted); line-height: 1.5; margin-bottom: .8rem; }
+  .btn-secondary {
+    width: 100%; padding: .7rem; cursor: pointer;
+    border: 1px solid var(--accent-lo); border-radius: var(--r);
+    background: transparent; color: var(--accent);
+    font-size: .88rem; font-weight: 600;
+    transition: background .15s;
+  }
+  .btn-secondary:disabled { opacity: .38; cursor: not-allowed; }
+  .btn-secondary:hover:not(:disabled) { background: rgba(56,139,253,.08); }
+
   /* Download */
   .dl-btn {
     display: none; width: 100%; margin-top: .75rem; padding: .7rem;
@@ -228,6 +246,23 @@ HTML = r"""<!doctype html>
   </div>
   <a class="dl-btn" id="dl">&#8595; Download Coordinates (ZIP)</a>
 
+  <div class="next" id="next">
+    <div class="next-h">Next step &mdash; 3D skeleton movie</div>
+    <p class="next-p">
+      Animate the tracked joints in 3D over time, with bones drawn between
+      connected landmarks. Built from the coordinates above &mdash; the video is
+      not re-processed.
+    </p>
+    <button class="btn-secondary" id="mkmovie">Create 3D Movie</button>
+    <div class="status" id="mst"><span class="spin" id="mspin"></span><span id="mstmsg"></span>
+      <div class="pwrap" id="mpwrap">
+        <div class="ptrack"><div class="pfill" id="mpfill"></div></div>
+        <div class="pmeta"><span id="mpstage"></span><span class="pct" id="mppct"></span></div>
+      </div>
+    </div>
+    <a class="dl-btn" id="mdl">&#8595; Download 3D Movie (MP4)</a>
+  </div>
+
   <div class="hint">
     <b>What to upload:</b> ZIP the output folder from the iPad app <b>Stray Scanner</b>.
     In the Files app, find your recording session folder, long-press it, and tap
@@ -254,6 +289,17 @@ const pfill = document.getElementById('pfill');
 const pstage = document.getElementById('pstage');
 const ppct = document.getElementById('ppct');
 const dl   = document.getElementById('dl');
+const next = document.getElementById('next');
+const mkmovie = document.getElementById('mkmovie');
+const mst  = document.getElementById('mst');
+const mspin = document.getElementById('mspin');
+const mstmsg = document.getElementById('mstmsg');
+const mpwrap = document.getElementById('mpwrap');
+const mpfill = document.getElementById('mpfill');
+const mpstage = document.getElementById('mpstage');
+const mppct = document.getElementById('mppct');
+const mdl  = document.getElementById('mdl');
+let currentJob = null;
 
 let chosen = null;
 
@@ -317,6 +363,9 @@ go.addEventListener('click', async () => {
         dl.href = '/download/' + jobId;
         dl.className = 'dl-btn vis';
         go.disabled = false;
+        currentJob = jobId;
+        next.className = 'next vis';
+        mkmovie.disabled = false;
       } else if (d.status === 'error') {
         clearInterval(iv);
         pwrap.className = 'pwrap';
@@ -327,6 +376,70 @@ go.addEventListener('click', async () => {
     } catch (e) { clearInterval(iv); fail('Lost connection to server'); }
   }, 3000);
 });
+
+mkmovie.addEventListener('click', async () => {
+  if (!currentJob) return;
+  mkmovie.disabled = true;
+  mdl.className = 'dl-btn';
+  mst.className = 'status vis proc';
+  mspin.style.display = 'inline-block';
+  mstmsg.textContent = 'Rendering 3D skeleton…';
+  mpwrap.className = 'pwrap vis';
+  setMovieProgress(0, 'Starting…');
+  const started = Date.now();
+
+  try {
+    const r = await fetch('/animate/' + currentJob, { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Could not start the render');
+  } catch (e) { return movieFail(e.message); }
+
+  const iv = setInterval(async () => {
+    try {
+      const r = await fetch('/movie-status/' + currentJob);
+      const d = await r.json();
+      if (d.status === 'done') {
+        clearInterval(iv);
+        mspin.style.display = 'none';
+        mpwrap.className = 'pwrap';
+        mst.className = 'status vis done';
+        mstmsg.textContent = 'Your 3D movie is ready.';
+        mdl.href = '/download-movie/' + currentJob;
+        mdl.className = 'dl-btn vis';
+        mkmovie.disabled = false;
+      } else if (d.status === 'error') {
+        clearInterval(iv);
+        movieFail(d.error || 'Unknown error');
+      } else {
+        setMovieProgress(d.percent, d.stage, (Date.now() - started) / 1000);
+      }
+    } catch (e) { clearInterval(iv); movieFail('Lost connection to server'); }
+  }, 3000);
+});
+
+function setMovieProgress(pct, stage, elapsed) {
+  if (!pct) {
+    mpfill.className = 'pfill indet';
+    mppct.textContent = '';
+  } else {
+    mpfill.className = 'pfill';
+    mpfill.style.width = pct + '%';
+    let label = pct + '%';
+    if (elapsed && pct >= 3) {
+      const left = Math.round(elapsed * (100 - pct) / pct);
+      if (left > 0) label += ' · ~' + fmt(left) + ' left';
+    }
+    mppct.textContent = label;
+  }
+  mpstage.textContent = stage || '';
+}
+function movieFail(msg) {
+  mspin.style.display = 'none';
+  mpwrap.className = 'pwrap';
+  mst.className = 'status vis err';
+  mstmsg.textContent = 'Error: ' + msg;
+  mkmovie.disabled = false;
+}
 
 function setProgress(pct, stage, elapsed) {
   // Before the first joint reports in there is nothing to measure, so show a
@@ -365,6 +478,11 @@ function reset() {
   st.className = 'status';
   dl.className = 'dl-btn';
   pwrap.className = 'pwrap';
+  next.className = 'next';
+  mst.className = 'status';
+  mdl.className = 'dl-btn';
+  mpwrap.className = 'pwrap';
+  currentJob = null;
 }
 </script>
 </body>
@@ -453,6 +571,53 @@ def download(job_id):
         as_attachment=True,
         download_name='gait_coordinates.zip',
         mimetype='application/zip',
+    )
+
+
+@app.route('/animate/<job_id>', methods=['POST'])
+def animate(job_id):
+    """Render the 3D skeleton movie from a finished job's CSVs."""
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return jsonify(error='unknown job'), 404
+        if job['status'] != 'done':
+            return jsonify(error='coordinates are not ready yet'), 400
+        if job.get('movie_status') == 'processing':
+            return jsonify(job_id=job_id)          # already running
+        job['movie_status'] = 'processing'
+        job['movie_percent'] = 0
+        job['movie_stage'] = 'Queued…'
+        job['movie_error'] = None
+        job['movie'] = None
+
+    threading.Thread(target=_run_movie, args=(job_id,), daemon=True).start()
+    return jsonify(job_id=job_id)
+
+
+@app.route('/movie-status/<job_id>')
+def movie_status(job_id):
+    with _lock:
+        job = dict(_jobs.get(job_id, {}))
+    if not job:
+        return jsonify(error='unknown job'), 404
+    return jsonify(status=job.get('movie_status', 'idle'),
+                   error=job.get('movie_error'),
+                   percent=job.get('movie_percent', 0),
+                   stage=job.get('movie_stage', ''))
+
+
+@app.route('/download-movie/<job_id>')
+def download_movie(job_id):
+    with _lock:
+        job = dict(_jobs.get(job_id, {}))
+    if not job or job.get('movie_status') != 'done':
+        return jsonify(error='movie not ready'), 400
+    return send_file(
+        io.BytesIO(job['movie']),
+        as_attachment=True,
+        download_name='gait_skeleton_3d.mp4',
+        mimetype='video/mp4',
     )
 
 
@@ -596,6 +761,92 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str) -> None:
             _jobs[job_id] = {'status': 'error', 'result': None, 'error': str(exc),
                              'percent': prev.get('percent', 0),
                              'stage': prev.get('stage', '')}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _set_movie_progress(job_id: str, percent: float, stage: str) -> None:
+    with _lock:
+        job = _jobs.get(job_id)
+        if job is not None:
+            job['movie_percent'] = max(0, min(100, round(percent)))
+            job['movie_stage'] = stage
+
+
+def _run_movie(job_id: str) -> None:
+    """Render the 3D skeleton MP4 from the CSVs already produced by the job."""
+    work = tempfile.mkdtemp(prefix='lidar_mov_')
+    try:
+        with _lock:
+            csv_zip = _jobs[job_id]['result']
+
+        # The coordinate CSVs are already in memory as the result ZIP — unpack
+        # them rather than re-running the pipeline.
+        data_dir = os.path.join(work, 'data')
+        os.makedirs(data_dir, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(csv_zip)) as zf:
+            for name in zf.namelist():
+                if name.endswith('.csv'):
+                    with zf.open(name) as src, \
+                            open(os.path.join(data_dir, os.path.basename(name)), 'wb') as dst:
+                        shutil.copyfileobj(src, dst)
+
+        out_path = os.path.join(work, 'skeleton.mp4')
+        script = '; '.join([
+            'import sys',
+            f'sys.path.insert(0, {repr(GAIT_DIR)})',
+            'import skeleton3d',
+            f'skeleton3d.render_movie(skeleton3d.load_landmarks({repr(data_dir)}), '
+            f'{repr(out_path)})',
+        ])
+
+        _set_movie_progress(job_id, 0, 'Starting 3D render…')
+        proc = subprocess.Popen(
+            [sys.executable, '-u', '-c', script],
+            cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+
+        tail = collections.deque(maxlen=100)
+        deadline = time.monotonic() + PIPELINE_TIMEOUT
+        for raw in proc.stdout:
+            tail.append(raw)
+            line = raw.strip()
+            if line.startswith('@@RENDER '):
+                try:
+                    done, total = (int(v) for v in line[9:].split('/'))
+                    if total:
+                        _set_movie_progress(job_id, 97 * done / total,
+                                            f'Rendering frame {done}/{total}')
+                except ValueError:
+                    pass
+            if time.monotonic() > deadline:
+                proc.kill()
+                raise RuntimeError('3D render timed out.')
+
+        if proc.wait() != 0:
+            raise RuntimeError('3D render failed:\n' + ''.join(tail)[-3000:])
+        if not os.path.exists(out_path):
+            raise RuntimeError('3D render produced no file.')
+
+        _set_movie_progress(job_id, 99, 'Packaging movie…')
+        with open(out_path, 'rb') as fh:
+            movie = fh.read()
+
+        with _lock:
+            job = _jobs.get(job_id)
+            if job is not None:
+                job['movie'] = movie
+                job['movie_status'] = 'done'
+                job['movie_percent'] = 100
+                job['movie_stage'] = 'Complete'
+
+    except Exception as exc:
+        with _lock:
+            job = _jobs.get(job_id)
+            if job is not None:
+                job['movie_status'] = 'error'
+                job['movie_error'] = str(exc)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

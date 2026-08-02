@@ -77,29 +77,47 @@ def render_movie(landmarks, out_path, fps=60, size=(720, 540), elev=12, azim=-70
     """Animate the landmarks in 3D and write an MP4 to out_path."""
     pts = {k: _to_plot_space(v) for k, v in landmarks.items()}
     n_frames = len(next(iter(pts.values())))
-    stacked = np.concatenate(list(pts.values()), axis=0)
 
-    # Drop the (0,0,0) sentinels the tracker emits when a joint is never seen,
-    # so they don't stretch the axes to include the origin.
-    real = stacked[~np.all(np.isclose(stacked, 0.0), axis=1)]
-    finite = real[np.isfinite(real).all(axis=1)] if len(real) else stacked
+    # (n_frames, n_landmarks, 3)
+    seq = np.stack([pts[name] for name in LANDMARKS], axis=1)
 
-    # One cubic bounding box keeps the body from being distorted by autoscaling
-    lo, hi = finite.min(axis=0), finite.max(axis=0)
-    centre = (lo + hi) / 2.0
-    span = float(np.max(hi - lo))
+    # The tracker emits (0,0,0) when a joint was never seen. Those would drag
+    # the framing toward the origin, so ignore them when sizing and centring.
+    valid = ~np.all(np.isclose(seq, 0.0), axis=2) & np.isfinite(seq).all(axis=2)
+    if not valid.any():
+        raise RuntimeError("No usable landmark coordinates to animate")
+
+    masked = np.where(valid[..., None], seq, np.nan)
+
+    # The subject walks several metres toward the camera. A single box around
+    # the whole trajectory would shrink the body to a few pixels, so the view
+    # follows the subject instead, at a fixed scale so limb motion stays
+    # comparable frame to frame.
+    centres = np.nanmean(masked, axis=1)                       # (n_frames, 3)
+    extents = np.nanmax(masked, axis=1) - np.nanmin(masked, axis=1)
+    span = float(np.nanmax(extents))
     if not np.isfinite(span) or span <= 0:
         span = 1.0
-    half = span / 2.0 * 1.15
+    half = span / 2.0 * 1.35
+
+    # Carry the last good centre through frames where nothing was tracked, then
+    # smooth so the camera glides rather than jitters with per-frame noise.
+    for i in range(n_frames):
+        if not np.isfinite(centres[i]).all():
+            centres[i] = centres[i - 1] if i else np.zeros(3)
+    win = max(1, min(15, n_frames))
+    kernel = np.ones(win) / win
+    centres = np.stack([
+        np.convolve(np.pad(centres[:, a], (win // 2, win - 1 - win // 2), mode='edge'),
+                    kernel, mode='valid')
+        for a in range(3)
+    ], axis=1)
 
     w, h = size
     dpi = 100
     fig = plt.figure(figsize=(w / dpi, h / dpi), dpi=dpi)
     ax = fig.add_subplot(111, projection="3d")
     ax.view_init(elev=elev, azim=azim)
-    ax.set_xlim(centre[0] - half, centre[0] + half)
-    ax.set_ylim(centre[1] - half, centre[1] + half)
-    ax.set_zlim(centre[2] - half, centre[2] + half)
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Depth from camera (m)")
     # Negative values are normal here: the camera axis origin sits above the
@@ -126,10 +144,18 @@ def render_movie(landmarks, out_path, fps=60, size=(720, 540), elev=12, azim=-70
                 line.set_data([pa[0], pb[0]], [pa[1], pb[1]])
                 line.set_3d_properties([pa[2], pb[2]])
 
-            frame_pts = np.array([pts[name][i] for name in LANDMARKS])
+            frame_pts = seq[i]
             joint_dots.set_data(frame_pts[:, 0], frame_pts[:, 1])
             joint_dots.set_3d_properties(frame_pts[:, 2])
-            label.set_text(f"frame {i + 1}/{n_frames}   t = {i / 60.0:5.2f}s")
+
+            # Re-centre on the subject, keeping the box the same size
+            cx, cy, cz = centres[i]
+            ax.set_xlim(cx - half, cx + half)
+            ax.set_ylim(cy - half, cy + half)
+            ax.set_zlim(cz - half, cz + half)
+
+            label.set_text(f"frame {i + 1}/{n_frames}   t = {i / 60.0:5.2f}s   "
+                           f"depth {cy:4.2f} m")
 
             fig.canvas.draw()
             rgba = np.asarray(fig.canvas.buffer_rgba())
