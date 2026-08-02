@@ -1,0 +1,4 @@
+# Shell scripts run on Linux (Azure App Service). CRLF line endings would make
+# bash fail with "\r: command not found", so keep them LF on checkout even when
+# the repo is cloned on Windows.
+*.sh text eol=lf

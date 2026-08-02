@@ -1,0 +1,188 @@
+import os
+import cv2
+import numpy as np
+from rtmlib import Body, PoseTracker
+
+# COCO 17-keypoint indices used by RTMPose
+# (replaces MediaPipe's landmark numbering scheme)
+landmark_map = {
+    "left shoulder": 5,
+    "right shoulder": 6,
+    "left elbow": 7,
+    "right elbow": 8,
+    "left wrist": 9,
+    "right wrist": 10,
+    "left hip": 11,
+    "right hip": 12,
+    "left knee": 13,
+    "right knee": 14,
+    "left ankle": 15,
+    "right ankle": 16,
+}
+
+# LiDAR video dimensions
+width, height = 192, 256
+
+# Person detection is the expensive half of the pipeline, so reuse each box for
+# the following frames. At 60 FPS the subject barely moves in 10 frames — this
+# measured 0.4 px off full per-frame detection while running ~8x faster.
+DET_FREQUENCY = 10
+
+
+def _make_tracker():
+    """RTMPose (rtmpose-m) on ONNX Runtime — no torch, no mmcv, no mmdet.
+
+    Weights download once to ~/.cache/rtmlib (~155 MB: yolox_m + rtmpose-m).
+    """
+    return PoseTracker(Body, mode='balanced', backend='onnxruntime',
+                       device='cpu', det_frequency=DET_FREQUENCY,
+                       tracking=False, to_openpose=False)
+
+
+def extract_all_landmarks(folder):
+    """Track every landmark in one pass over the video.
+
+    Returns {landmark name: [(x, y, z), ...]} in metres, one entry per frame.
+    A single pass serves all joints — calculateangle used to re-run the whole
+    video once per joint, which cost 6x more inference than necessary.
+    """
+    # Paths
+    video_path = os.path.join(folder, "rgb.mp4")
+    depth_folder = os.path.join(folder, "depth")
+    conf_folder = os.path.join(folder, "confidence")
+
+    # Ignore non-frame entries (.DS_Store, AppleDouble ._* files a Mac/iOS zip adds)
+    def frame_pngs(d):
+        return sorted(f for f in os.listdir(d)
+                      if f.lower().endswith('.png') and not f.startswith('.'))
+
+    # Depth drives the frame sequence; confidence is matched by filename rather
+    # than by list position. A session with gaps in confidence/ would otherwise
+    # silently pair depth 000000 with confidence 000026 and so on.
+    depth_files = frame_pngs(depth_folder)
+    conf_names = set(frame_pngs(conf_folder))
+
+    n_lidar = len(depth_files)
+    if n_lidar == 0:
+        raise RuntimeError(f"No depth PNGs found in {depth_folder}")
+
+    n_missing = sum(1 for f in depth_files if f not in conf_names)
+    if n_missing:
+        print(f"Warning: {n_missing}/{n_lidar} frames have no confidence map; "
+              f"treating their depth as valid.")
+
+    # Load and scale intrinsics
+    csvmatrix = np.loadtxt(f'{folder}/camera_matrix.csv', delimiter=',')
+    scale_x = height / 1440
+    scale_y = width / 1920
+    matrixscaled = csvmatrix.copy()
+    matrixscaled[0, 0] *= scale_x
+    matrixscaled[1, 1] *= scale_y
+    matrixscaled[0, 2] *= scale_x
+    matrixscaled[1, 2] *= scale_y
+    fx, fy = matrixscaled[0, 0], matrixscaled[1, 1]
+    cx, cy = matrixscaled[0, 2], matrixscaled[1, 2]
+
+    # One output array per landmark
+    arrays = {name: [] for name in landmark_map}
+    prev = {name: None for name in landmark_map}
+
+    tracker = _make_tracker()
+    cap = cv2.VideoCapture(video_path)
+    frame_i = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret or frame_i >= n_lidar:
+            break
+
+        # Orient and resize to match LiDAR dimensions (same as original)
+        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        frame = cv2.resize(frame, (width, height))
+
+        if frame_i == 0:
+            print("Loading...")
+        if frame_i % 10 == 0:
+            # Progress marker consumed by the web app's job runner
+            print(f"@@FRAME {frame_i}/{n_lidar}", flush=True)
+
+        # Run RTMPose — keypoints (N, 17, 2), scores (N, 17)
+        keypoints, scores = tracker(frame)
+        kps = None
+        if keypoints is not None and len(keypoints):
+            # Pick the most confident person (handles multi-person scenes)
+            best = int(np.argmax(np.asarray(scores).mean(axis=1)))
+            kps = np.asarray(keypoints)[best]
+
+        # Load depth/confidence once per frame, pairing them by filename
+        fname = depth_files[frame_i]
+        depth_mm = cv2.imread(os.path.join(depth_folder, fname), cv2.IMREAD_UNCHANGED)
+        if depth_mm is None:
+            print(f"Missing depth at frame {frame_i} ({fname})")
+            break
+
+        # conf stays None when this frame has no confidence map — the depth
+        # is then taken at face value.
+        conf = None
+        if fname in conf_names:
+            conf = cv2.imread(os.path.join(conf_folder, fname), cv2.IMREAD_UNCHANGED)
+
+        depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_90_CLOCKWISE)
+        if conf is not None:
+            conf = cv2.rotate(conf, cv2.ROTATE_90_CLOCKWISE)
+        depth_meters = depth_mm / 1000.0
+
+        # Returns the 3d coordinate of a landmark if the LiDAR is confident
+        # enough there, otherwise reusing the previous frame's depth
+        def extract_one(name, idx):
+            if kps is not None:
+                pos = (int(kps[idx][0]), int(kps[idx][1]))
+                prev[name] = pos
+            else:
+                pos = prev[name]
+
+            if pos:
+                pointx = int(np.clip(pos[0], 0, width - 1))
+                pointy = int(np.clip(pos[1], 0, height - 1))
+                if frame_i == 0 or conf is None or conf[pointy, pointx] > 0:
+                    z = depth_meters[pointy, pointx]
+                else:
+                    # Fallback to previous frame's depth when LiDAR confidence is 0
+                    z = arrays[name][frame_i - 1][2]
+                x = (pointx - cx) * z / fx
+                y = (pointy - cy) * z / fy
+                return (x, y, z)
+            else:
+                print(f"No position for {name} at frame {frame_i}")
+                return (0, 0, 0)
+
+        for name, idx in landmark_map.items():
+            arrays[name].append(extract_one(name, idx))
+
+        frame_i += 1
+
+    cap.release()
+    return arrays
+
+
+def extract_landmarks(folder, input1, input2, input3):
+    """Back-compatible wrapper returning just the three requested landmarks."""
+    arrays = extract_all_landmarks(folder)
+    l1_arr, l2_arr, l3_arr = arrays[input1], arrays[input2], arrays[input3]
+
+    # Save to cache
+    save_dir = os.path.join(folder, input1)
+    os.makedirs(save_dir, exist_ok=True)
+    np.savez(os.path.join(save_dir, "landmark_cache.npz"),
+             l1=l1_arr, l2=l2_arr, l3=l3_arr,
+             input1=input1, input2=input2, input3=input3)
+
+    return l1_arr, l2_arr, l3_arr, input1, input2, input3
+
+
+if __name__ == '__main__':
+    folder = input("Folder name: ")
+    input1 = input("left knee, right knee, left elbow, or right elbow: ")
+    input2 = input("left hip, right hip, left shoulder, or right shoulder: ")
+    input3 = input("left ankle, right ankle, left wrist, or right wrist: ")
+    extract_landmarks(folder, input1, input2, input3)

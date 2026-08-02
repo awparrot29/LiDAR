@@ -1,3 +1,27 @@
+# --- Stray Scanner recording sessions -------------------------------------
+# These contain rgb.mp4 of human participants. Keep research data out of the
+# repository; session folders dropped in the root stay ignored.
+**/depth/
+**/confidence/
+**/landmark_cache.npz
+Aug_07_2025/
+Jul_30/
+park2/
+park_sim/
+
+# Recordings, archives and point clouds
+*.mp4
+*.zip
+*.ply
+
+# Pipeline output
+charts/
+
+# Local scratch / editor / deploy cruft
+.azure/
+.idea/
+New folder/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

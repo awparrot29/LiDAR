@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+park2/
+Jul_30/
+Aug_07_2025/
+park_sim/
+charts/
+sample-results/
+New folder/
+*.zip
+*.ply
+*.mp4

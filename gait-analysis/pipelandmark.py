@@ -22,13 +22,38 @@ landmark_map = {
 # LiDAR video dimensions
 width, height = 192, 256
 
-def extract_landmarks(folder, input1, input2, input3):
+
+def extract_all_landmarks(folder):
+    """Track every landmark in one pass over the video.
+
+    Returns {landmark name: [(x, y, z), ...]} in metres, one entry per frame.
+    A single pass serves all joints — calculateangle used to re-run the whole
+    video once per joint, which cost 6x more inference than necessary.
+    """
     # Paths
     video_path = os.path.join(folder, "rgb.mp4")
     depth_folder = os.path.join(folder, "depth")
     conf_folder = os.path.join(folder, "confidence")
-    depth_files = sorted(os.listdir(depth_folder))
-    conf_files = sorted(os.listdir(conf_folder))
+
+    # Ignore non-frame entries (.DS_Store, AppleDouble ._* files a Mac/iOS zip adds)
+    def frame_pngs(d):
+        return sorted(f for f in os.listdir(d)
+                      if f.lower().endswith('.png') and not f.startswith('.'))
+
+    # Depth drives the frame sequence; confidence is matched by filename rather
+    # than by list position. A session with gaps in confidence/ would otherwise
+    # silently pair depth 000000 with confidence 000026 and so on.
+    depth_files = frame_pngs(depth_folder)
+    conf_names = set(frame_pngs(conf_folder))
+
+    n_lidar = len(depth_files)
+    if n_lidar == 0:
+        raise RuntimeError(f"No depth PNGs found in {depth_folder}")
+
+    n_missing = sum(1 for f in depth_files if f not in conf_names)
+    if n_missing:
+        print(f"Warning: {n_missing}/{n_lidar} frames have no confidence map; "
+              f"treating their depth as valid.")
 
     # Load and scale intrinsics
     csvmatrix = np.loadtxt(f'{folder}/camera_matrix.csv', delimiter=',')
@@ -42,11 +67,9 @@ def extract_landmarks(folder, input1, input2, input3):
     fx, fy = matrixscaled[0, 0], matrixscaled[1, 1]
     cx, cy = matrixscaled[0, 2], matrixscaled[1, 2]
 
-    # Landmark indices
-    idx1, idx2, idx3 = landmark_map[input1], landmark_map[input2], landmark_map[input3]
-
-    # Output arrays
-    l1_arr, l2_arr, l3_arr = [], [], []
+    # One output array per landmark
+    arrays = {name: [] for name in landmark_map}
+    prev = {name: None for name in landmark_map}
 
     # Pose estimation setup
     mp_pose = mp.solutions.pose
@@ -57,14 +80,13 @@ def extract_landmarks(folder, input1, input2, input3):
                       min_tracking_confidence=0.5) as pose:
 
         frame_i = 0
-        prev = {idx1: None, idx2: None, idx3: None}
 
         # Read frames
         while cap.isOpened():
             ret, frame = cap.read()
-            if not ret:
+            if not ret or frame_i >= n_lidar:
                 break
-            
+
             # Orient frame and change to RGB for mediapipe
             frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
             frame = cv2.resize(frame, (width, height))
@@ -74,49 +96,67 @@ def extract_landmarks(folder, input1, input2, input3):
 
             if frame_i == 0:
                 print("Loading...")
+            if frame_i % 10 == 0:
+                # Progress marker consumed by the web app's job runner
+                print(f"@@FRAME {frame_i}/{n_lidar}", flush=True)
 
-            # Load depth/confidence once per frame
-            depth_mm = cv2.imread(os.path.join(depth_folder, depth_files[frame_i]), cv2.IMREAD_UNCHANGED)
-            conf = cv2.imread(os.path.join(conf_folder, conf_files[frame_i]), cv2.IMREAD_UNCHANGED)
-            if depth_mm is None or conf is None:
-                print(f"Missing depth/confidence at frame {frame_i}")
+            # Load depth/confidence once per frame, pairing them by filename
+            fname = depth_files[frame_i]
+            depth_mm = cv2.imread(os.path.join(depth_folder, fname), cv2.IMREAD_UNCHANGED)
+            if depth_mm is None:
+                print(f"Missing depth at frame {frame_i} ({fname})")
                 break
+
+            # conf stays None when this frame has no confidence map — the depth
+            # is then taken at face value.
+            conf = None
+            if fname in conf_names:
+                conf = cv2.imread(os.path.join(conf_folder, fname), cv2.IMREAD_UNCHANGED)
 
             # Orient/convert depth and confidence data
             depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_90_CLOCKWISE)
-            conf = cv2.rotate(conf, cv2.ROTATE_90_CLOCKWISE)
+            if conf is not None:
+                conf = cv2.rotate(conf, cv2.ROTATE_90_CLOCKWISE)
             depth_meters = depth_mm / 1000.0
 
-            # Takes in a landmark index and array label and returns the 3d coordinate of the point if it is confident enough, otherwise defaulting back to that of the previous frame
-            def extract_one(idx, label):
+            # Takes in a landmark name/index and returns the 3d coordinate of the point if it is confident enough, otherwise defaulting back to that of the previous frame
+            def extract_one(name, idx):
                 if results.pose_landmarks:
                     lm = results.pose_landmarks.landmark[idx]
                     pos = (int(lm.x * width), int(lm.y * height))
-                    prev[idx] = pos
+                    prev[name] = pos
                 else:
-                    pos = prev[idx]
+                    pos = prev[name]
 
                 if pos:
-                    pointx = np.clip(pos[0], 0, width - 1)
-                    pointy = np.clip(pos[1], 0, height - 1)
-                    if frame_i == 0 or conf[pointy, pointx] > 0:
+                    pointx = int(np.clip(pos[0], 0, width - 1))
+                    pointy = int(np.clip(pos[1], 0, height - 1))
+                    if frame_i == 0 or conf is None or conf[pointy, pointx] > 0:
                         z = depth_meters[pointy, pointx]
                     else:
                         # Fallback to previous z
-                        z = {'l1': l1_arr, 'l2': l2_arr, 'l3': l3_arr}[label][frame_i - 1][2]
+                        z = arrays[name][frame_i - 1][2]
                     x = (pointx - cx) * z / fx
                     y = (pointy - cy) * z / fy
                     return (x, y, z)
                 else:
-                    print(f"No position for {label} at frame {frame_i}")
+                    print(f"No position for {name} at frame {frame_i}")
                     return (0, 0, 0)
 
             # Add the 3d coordinates to the arrays
-            l1_arr.append(extract_one(idx1, 'l1'))
-            l2_arr.append(extract_one(idx2, 'l2'))
-            l3_arr.append(extract_one(idx3, 'l3'))
+            for name, idx in landmark_map.items():
+                arrays[name].append(extract_one(name, idx))
 
             frame_i += 1
+
+    cap.release()
+    return arrays
+
+
+def extract_landmarks(folder, input1, input2, input3):
+    """Back-compatible wrapper returning just the three requested landmarks."""
+    arrays = extract_all_landmarks(folder)
+    l1_arr, l2_arr, l3_arr = arrays[input1], arrays[input2], arrays[input3]
 
     # Save to cache
     save_dir = os.path.join(folder, input1)
@@ -126,6 +166,7 @@ def extract_landmarks(folder, input1, input2, input3):
              input1=input1, input2=input2, input3=input3)
 
     return l1_arr, l2_arr, l3_arr, input1, input2, input3
+
 
 if __name__ == '__main__':
     folder = input("Folder name: ")

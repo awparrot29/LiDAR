@@ -1,0 +1,12 @@
+flask
+gunicorn
+numpy
+# Pinned: mediapipe 1.x removed the legacy `mp.solutions` API that
+# gait-analysis/pipelandmark.py depends on. 0.10.14 matches the local env.
+mediapipe==0.10.14
+matplotlib
+pandas
+# RTMPose tracker. rtmlib runs the same rtmpose-m model on ONNX Runtime, which
+# avoids pulling in torch + mmcv + mmdet (~1.5 GB) for ~15 MB instead.
+rtmlib
+onnxruntime

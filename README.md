@@ -8,6 +8,8 @@ This project analyzes human gait using RGB-D video from LiDAR-enabled iPhones/iP
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Usage](#usage)
+- [Web App](#web-app)
+- [Pose Trackers](#pose-trackers)
 - [General-LiDAR](#general-lidar)
 - [Gait-Analysis](#gait-analysis)
 
@@ -90,6 +92,76 @@ To run a [gait-analysis](#gait-analysis) program (ex. detrend.py), ensure you ar
    python3.10 gait-analysis/detrend.py
    ```
 
+## Web App
+
+`app.py` wraps the gait-analysis pipeline in a Flask web app so a session can be
+processed without a local Python environment. Upload a zipped Stray Scanner
+folder, pick a tracker, and it returns a ZIP of the joint coordinate and angle
+CSVs. A progress bar reports the frame being tracked and an estimated time
+remaining.
+
+Run it locally with:
+
+   ```bash
+   pip install -r requirements.txt
+   python app.py
+   ```
+
+then open http://localhost:5000.
+
+The app extracts the upload to a temporary directory, runs `calculateangle.py`
+in a subprocess there, and bundles `charts/<session>/data/*.csv` into the
+response. Nothing is written to the repository and uploads are deleted once the
+job finishes.
+
+### Deploying to Azure App Service
+
+The app runs on a Free (F1) Linux Python 3.11 plan. Two deployment details are
+easy to get wrong:
+
+- **Set the startup command to `gunicorn --bind=0.0.0.0 --timeout 600 app:app`
+  directly.** Wrapping it in a shell script fails with exit code 127, because a
+  bash script does not inherit the Oryx virtual environment on its PATH.
+- **`apt-get` during the build does not persist to the runtime container** —
+  only `/home` and the built virtualenv carry over. Missing shared libraries
+  must be resolved at the Python-package level instead. `postbuild.sh` does this
+  for OpenCV: both MediaPipe and rtmlib depend on GUI OpenCV builds that need
+  `libGL`/`libxcb`, so it swaps them for `opencv-contrib-python-headless` after
+  the install step.
+
+`GET /healthz` reports the import status of every native dependency, which is
+the quickest way to verify a deployment.
+
+## Pose Trackers
+
+Two interchangeable pose backends are available; both produce identical output
+formats, so they can be swapped freely.
+
+| Module | Model | Keypoints | Notes |
+|---|---|---|---|
+| pipelandmark.py | MediaPipe Pose (heavy) | 33-point BlazePose | Original tracker. Bundles its own runtime. |
+| pipelandmark_rtmpose.py | RTMPose-m via rtmlib | COCO 17-point | Runs on ONNX Runtime — no PyTorch, mmcv or mmdet. |
+
+`pipelandmark_rtmpose.py` is a drop-in replacement: swap the import in
+`calculateangle.py`, or select the tracker in the web app. It uses rtmlib's
+`PoseTracker` with `det_frequency=10`, reusing each person-detection box for ten
+frames. Detection is the expensive half of the pipeline, and at 60 FPS the
+subject barely moves in that window, so this runs roughly eight times faster
+than detecting every frame while staying within half a pixel of it. Model
+weights (~155 MB) download automatically to `~/.cache/rtmlib` on first use.
+
+Measured on a 717-frame session, the two trackers agree to a median of about
+2 cm per joint.
+
+### Single-pass tracking
+
+`extract_all_landmarks(folder)` tracks every landmark in **one** pass over the
+video and returns `{landmark name: [(x, y, z), ...]}`. `calculateangle.py` calls
+it once and slices out the joints it needs. Earlier versions called
+`extract_landmarks()` once per joint, re-running the whole video six times;
+avoiding that cut a 458-frame session from 424 s to 111 s. `extract_landmarks()`
+is still available as a wrapper for the three-landmark call style.
+
 ## General-LiDAR
 
 The general-lidar folder contains 5 programs whose functionalities are described below. These programs are general-purpose LiDAR data analysis and visualization tools as opposed to specific tools targeted for gait analysis.
@@ -139,6 +211,7 @@ The gait-analysis folder contains 4 programs whose functionalities are described
 | calculateangle.py | Calculates joint locations and angles over time; saves CSV + graphs           |
 | detrend.py        | Plots joint movement over time, removes trendline for better insight        |
 | pipelandmark.py   | Helper module for joint location extraction (not used on its own)         |
+| pipelandmark_rtmpose.py | Same helper backed by RTMPose instead of MediaPipe (not used on its own) |
 
 **visualize.py**: This program displays the MediaPipe joint landmarks drawn onto the video, and saves it as an MP4.
 

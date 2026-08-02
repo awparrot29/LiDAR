@@ -26,9 +26,10 @@ def calculate_angle(A, B, C):
     norm_BA = np.linalg.norm(BA)
     norm_BC = np.linalg.norm(BC)
 
-    # Ensure BA and BC are not 0 vectors
+    # Ensure BA and BC are not 0 vectors. NaN rather than None so the angle
+    # stays numeric in the CSV — 'None' makes the whole column unparseable.
     if norm_BA == 0 or norm_BC == 0:
-        return None
+        return np.nan
 
     # Get cosine of the angle using formula (BA * BC / (|BA| * |BC|))
     cosine_angle = np.dot(BA, BC) / (norm_BA * norm_BC)
@@ -73,7 +74,15 @@ def main(folder=None, bp=None):
     if folder is None:
         folder = input("Folder name: ")
     
-    for bp in landmark_map:
+    # Tracked once on first need and shared by every joint below. The tracker
+    # returns all landmarks per frame, so one pass over the video answers all
+    # six joints — this used to re-run the whole video once per joint.
+    all_landmarks = None
+
+    for bp_i, bp in enumerate(landmark_map, start=1):
+        # Progress marker consumed by the web app's job runner
+        print(f"@@JOINT {bp_i}/{len(landmark_map)} {bp}", flush=True)
+
         # Get the three landmarks based on the landmark at which angle is being calculated
         bp1, bp2, bp3 = landmark_map[bp]
 
@@ -91,11 +100,18 @@ def main(folder=None, bp=None):
             print("Loaded from cache")
         # If pipelandmark hasn't been run, run it
         else:
-            print("Running pipelandmark...")
-            from pipelandmark import extract_landmarks
-            l1, l2, l3, input1, input2, input3 = extract_landmarks(folder, bp1, bp2, bp3)
+            if all_landmarks is None:
+                print("Running pipelandmark...")
+                from pipelandmark import extract_all_landmarks
+                all_landmarks = extract_all_landmarks(folder)
+
+            input1, input2, input3 = bp1, bp2, bp3
+            l1 = all_landmarks[bp1]
+            l2 = all_landmarks[bp2]
+            l3 = all_landmarks[bp3]
 
             # Save cache file for this data so pipelandmark doesn't have to be run on it again
+            os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
             np.savez(CACHE_FILE, l1=l1, l2=l2, l3=l3, input1=input1, input2=input2, input3=input3)
 
         l4 = []
