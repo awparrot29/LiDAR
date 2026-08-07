@@ -3,6 +3,8 @@ import cv2
 import numpy as np
 from rtmlib import Body, PoseTracker
 
+import sessiongeom
+
 # COCO 17-keypoint indices used by RTMPose
 # (replaces MediaPipe's landmark numbering scheme)
 landmark_map = {
@@ -20,7 +22,8 @@ landmark_map = {
     "right ankle": 16,
 }
 
-# LiDAR video dimensions
+# Default LiDAR frame dimensions (portrait). The real values come from
+# sessiongeom.frame_geometry(), which accounts for how the device was held.
 width, height = 192, 256
 
 # Person detection is the expensive half of the pipeline, so reuse each box for
@@ -71,17 +74,15 @@ def extract_all_landmarks(folder):
         print(f"Warning: {n_missing}/{n_lidar} frames have no confidence map; "
               f"treating their depth as valid.")
 
-    # Load and scale intrinsics
-    csvmatrix = np.loadtxt(f'{folder}/camera_matrix.csv', delimiter=',')
-    scale_x = height / 1440
-    scale_y = width / 1920
-    matrixscaled = csvmatrix.copy()
-    matrixscaled[0, 0] *= scale_x
-    matrixscaled[1, 1] *= scale_y
-    matrixscaled[0, 2] *= scale_x
-    matrixscaled[1, 2] *= scale_y
-    fx, fy = matrixscaled[0, 0], matrixscaled[1, 1]
-    cx, cy = matrixscaled[0, 2], matrixscaled[1, 2]
+    # How the device was held decides whether frames need rotating, and the
+    # rotation swaps the axes of the camera matrix, so the two come together.
+    geom = sessiongeom.frame_geometry(folder)
+    width, height = geom['width'], geom['height']
+    rotate = geom['rotate']
+    fx, fy = geom['fx'], geom['fy']
+    cx, cy = geom['cx'], geom['cy']
+    print(f"Session recorded in {geom['orientation']}; "
+          f"frame {width}x{height}, rotate={rotate}")
 
     # One output array per landmark
     arrays = {name: [] for name in landmark_map}
@@ -96,8 +97,10 @@ def extract_all_landmarks(folder):
         if not ret or frame_i >= n_lidar:
             break
 
-        # Orient and resize to match LiDAR dimensions (same as original)
-        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        # Stand the subject up (portrait recordings only) and match the
+        # LiDAR resolution
+        if rotate:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
         frame = cv2.resize(frame, (width, height))
 
         if frame_i == 0:
@@ -127,9 +130,11 @@ def extract_all_landmarks(folder):
         if fname in conf_names:
             conf = cv2.imread(os.path.join(conf_folder, fname), cv2.IMREAD_UNCHANGED)
 
-        depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_90_CLOCKWISE)
-        if conf is not None:
-            conf = cv2.rotate(conf, cv2.ROTATE_90_CLOCKWISE)
+        # Depth and confidence must be turned the same way as the RGB frame
+        if rotate:
+            depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_90_CLOCKWISE)
+            if conf is not None:
+                conf = cv2.rotate(conf, cv2.ROTATE_90_CLOCKWISE)
         depth_meters = depth_mm / 1000.0
 
         # Returns the 3d coordinate of a landmark if the LiDAR is confident

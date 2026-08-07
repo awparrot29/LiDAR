@@ -10,3 +10,7 @@ pandas
 # avoids pulling in torch + mmcv + mmdet (~1.5 GB) for ~15 MB instead.
 rtmlib
 onnxruntime
+# Bundles a static ffmpeg with libx264 so the movie is H.264 and plays
+# inline in a browser; OpenCV's mp4v output cannot be embedded.
+imageio
+imageio-ffmpeg

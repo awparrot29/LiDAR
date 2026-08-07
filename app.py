@@ -164,6 +164,17 @@ HTML = r"""<!doctype html>
   }
   .pmeta .pct { font-variant-numeric: tabular-nums; flex: none; }
 
+  /* Inline player */
+  .player { display: none; margin-top: 1rem; }
+  .player.vis { display: block; }
+  .player-h {
+    font-size: .78rem; color: var(--muted); margin-bottom: .4rem;
+  }
+  .player video {
+    width: 100%; display: block; border-radius: var(--r);
+    border: 1px solid var(--border); background: #000;
+  }
+
   /* Download */
   .dl-btn {
     display: none; width: 100%; margin-top: .75rem; padding: .7rem;
@@ -227,8 +238,12 @@ HTML = r"""<!doctype html>
       <div class="pmeta"><span id="pstage"></span><span class="pct" id="ppct"></span></div>
     </div>
   </div>
+  <div class="player" id="player">
+    <div class="player-h">3D skeleton &mdash; three-quarter and side view</div>
+    <video id="vid" controls autoplay loop muted playsinline preload="auto"></video>
+  </div>
+
   <a class="dl-btn" id="dl">&#8595; Download Results (ZIP: CSVs + 3D movie)</a>
-  <a class="dl-btn" id="mdl">&#8595; Download 3D Skeleton Movie (MP4)</a>
 
   <div class="hint">
     <b>What to upload:</b> ZIP the output folder from the iPad app <b>Stray Scanner</b>.
@@ -259,7 +274,8 @@ const pfill = document.getElementById('pfill');
 const pstage = document.getElementById('pstage');
 const ppct = document.getElementById('ppct');
 const dl   = document.getElementById('dl');
-const mdl  = document.getElementById('mdl');
+const player = document.getElementById('player');
+const vid  = document.getElementById('vid');
 
 let chosen = null;
 
@@ -472,16 +488,17 @@ def download(job_id):
 
 @app.route('/movie/<job_id>')
 def movie(job_id):
-    """The 3D stick figure MP4 on its own, so it can be watched without unzipping."""
+    """The 3D stick figure MP4, served inline so the page can play it directly."""
     with _lock:
         job = dict(_jobs.get(job_id, {}))
     if not job or job.get('status') != 'done' or not job.get('movie'):
         return jsonify(error='movie not available'), 400
+    # conditional=True gives range requests, which players use to seek
     return send_file(
         io.BytesIO(job['movie']),
-        as_attachment=True,
-        download_name=MOVIE_NAME,
         mimetype='video/mp4',
+        download_name=MOVIE_NAME,
+        conditional=True,
     )
 
 
@@ -531,13 +548,12 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str) -> None:
             'import calculateangle',
             f'calculateangle.main(folder={repr(session)})',
             # Then the 3D stick figure, built from the CSVs just written.
-            # camera_matrix.csv repairs pipelandmark's intrinsics scaling, which
-            # otherwise makes the subject appear to rise while walking closer.
+            # No intrinsics repair here: pipelandmark now derives them from the
+            # session's own orientation and camera matrix, so applying
+            # skeleton3d.repair_intrinsics would correct an already-correct
+            # projection twice.
             'import skeleton3d',
             f'_lm = skeleton3d.load_landmarks({repr(data_rel)})',
-            f'_cam = {repr(cam_rel)}',
-            '_lm = skeleton3d.repair_intrinsics(_lm, _cam) '
-            'if os.path.exists(_cam) else _lm',
             f'skeleton3d.render_movie(_lm, {repr(MOVIE_NAME)})',
         ]
         script = '; '.join(script_lines)

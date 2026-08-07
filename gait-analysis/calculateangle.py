@@ -1,6 +1,11 @@
 import numpy as np
 import os
 import matplotlib.pyplot as plt
+
+# Bumped whenever the coordinate geometry changes, so landmark caches written by
+# an older version are discarded instead of silently producing wrong output.
+# 1 = orientation-aware rotation + corrected intrinsics scaling.
+CACHE_SCHEMA = 1
 # Map pivot body part to the three landmarks to calculate angle
 landmark_map = {
     "left elbow": ("left elbow", "left shoulder", "left wrist"),
@@ -88,15 +93,26 @@ def main(folder=None, bp=None):
 
         CACHE_FILE = f'{folder}/{bp}/landmark_cache.npz'
 
-        # If pipelandmark has already been run, use the cache data
+        # If pipelandmark has already been run, use the cache data — but only
+        # if it was written by the current geometry. Caches from before the
+        # orientation/intrinsics fix hold coordinates that are metres out, and
+        # some session ZIPs ship them, so an unversioned cache is discarded.
+        cached = None
         if os.path.exists(CACHE_FILE):
             data = np.load(CACHE_FILE)
-            l1 = data['l1']
-            l2 = data['l2']
-            l3 = data['l3']
-            input1 = data['input1'].tolist()
-            input2 = data['input2'].tolist()
-            input3 = data['input3'].tolist()
+            if data.get('schema') is not None and int(data['schema']) == CACHE_SCHEMA:
+                cached = data
+            else:
+                print(f"Ignoring stale landmark cache for {bp} "
+                      f"(written before the orientation/intrinsics fix)")
+
+        if cached is not None:
+            l1 = cached['l1']
+            l2 = cached['l2']
+            l3 = cached['l3']
+            input1 = cached['input1'].tolist()
+            input2 = cached['input2'].tolist()
+            input3 = cached['input3'].tolist()
             print("Loaded from cache")
         # If pipelandmark hasn't been run, run it
         else:
@@ -112,7 +128,8 @@ def main(folder=None, bp=None):
 
             # Save cache file for this data so pipelandmark doesn't have to be run on it again
             os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-            np.savez(CACHE_FILE, l1=l1, l2=l2, l3=l3, input1=input1, input2=input2, input3=input3)
+            np.savez(CACHE_FILE, l1=l1, l2=l2, l3=l3, input1=input1,
+                     input2=input2, input3=input3, schema=CACHE_SCHEMA)
 
         l4 = []
         for i in range(len(l1)):

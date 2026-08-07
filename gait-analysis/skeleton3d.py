@@ -110,6 +110,28 @@ def repair_intrinsics(coords, camera_matrix_path):
     return out
 
 
+def _open_writer(out_path, fps, width, height):
+    """Return (writer, kind). Prefers H.264 so the file plays in a browser.
+
+    OpenCV's mp4v output is MPEG-4 Part 2, which no major browser will play in a
+    <video> element, so the movie could only be downloaded. imageio-ffmpeg ships
+    a static ffmpeg with libx264, giving a genuinely embeddable file. yuv420p is
+    the pixel format players expect.
+    """
+    try:
+        import imageio.v2 as iio
+        return iio.get_writer(out_path, fps=fps, codec="libx264",
+                              pixelformat="yuv420p", macro_block_size=1), "h264"
+    except Exception as exc:                      # noqa: BLE001 - any failure
+        print(f"H.264 unavailable ({type(exc).__name__}); "
+              f"falling back to mp4v, which browsers cannot play inline.")
+        writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                 fps, (width, height))
+        if not writer.isOpened():
+            raise RuntimeError("Could not open any MP4 writer")
+        return writer, "mp4v"
+
+
 def _to_plot_space(arr):
     """Camera coords (x right, y down, z depth) -> plot coords (x, depth, up)."""
     return np.column_stack([arr[:, 0], arr[:, 2], -arr[:, 1]])
@@ -214,6 +236,7 @@ def render_movie(landmarks, out_path, fps=60, size=(1100, 430), elev=12,
 
     index = {name: k for k, name in enumerate(LANDMARKS)}
     writer = None
+    kind = None
     try:
         for i in range(n_frames):
             fp = seq[i]
@@ -230,24 +253,23 @@ def render_movie(landmarks, out_path, fps=60, size=(1100, 430), elev=12,
                            f"depth {true_depth[i]:4.2f} m")
 
             fig.canvas.draw()
-            bgr = cv2.cvtColor(np.asarray(fig.canvas.buffer_rgba()),
-                               cv2.COLOR_RGBA2BGR)
+            rgb = cv2.cvtColor(np.asarray(fig.canvas.buffer_rgba()),
+                               cv2.COLOR_RGBA2RGB)
 
             if writer is None:
-                fh, fw = bgr.shape[:2]
-                writer = cv2.VideoWriter(out_path,
-                                         cv2.VideoWriter_fourcc(*"mp4v"),
-                                         fps, (fw, fh))
-                if not writer.isOpened():
-                    raise RuntimeError("Could not open the MP4 writer")
-            writer.write(bgr)
+                writer, kind = _open_writer(out_path, fps,
+                                            rgb.shape[1], rgb.shape[0])
+            if kind == "h264":
+                writer.append_data(rgb)
+            else:
+                writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
 
             if i % progress_every == 0:
                 # Progress marker consumed by the web app's job runner
                 print(f"@@RENDER {i}/{n_frames}", flush=True)
     finally:
         if writer is not None:
-            writer.release()
+            writer.close() if kind == "h264" else writer.release()
         plt.close(fig)
 
     return out_path
