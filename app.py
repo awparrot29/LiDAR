@@ -22,6 +22,7 @@ app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2 GB
 
 GAIT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gait-analysis')
 PIPELINE_TIMEOUT = 3000  # seconds
+MOVIE_NAME = 'gait_skeleton_3d.mp4'
 
 _jobs: dict = {}
 _lock = threading.Lock()
@@ -226,7 +227,8 @@ HTML = r"""<!doctype html>
       <div class="pmeta"><span id="pstage"></span><span class="pct" id="ppct"></span></div>
     </div>
   </div>
-  <a class="dl-btn" id="dl">&#8595; Download Coordinates (ZIP)</a>
+  <a class="dl-btn" id="dl">&#8595; Download Results (ZIP: CSVs + 3D movie)</a>
+  <a class="dl-btn" id="mdl">&#8595; Download 3D Skeleton Movie (MP4)</a>
 
   <div class="hint">
     <b>What to upload:</b> ZIP the output folder from the iPad app <b>Stray Scanner</b>.
@@ -235,7 +237,10 @@ HTML = r"""<!doctype html>
     <code>rgb.mp4</code>, <code>camera_matrix.csv</code>,
     and the <code>depth/</code> &amp; <code>confidence/</code> frame folders.<br><br>
     <b>Output:</b> One CSV per joint (ankle, knee, hip, shoulder, elbow, wrist — left &amp; right)
-    with X&nbsp;Y&nbsp;Z coordinates per frame, plus angle CSVs for knees, hips, and elbows.<br><br>
+    with X&nbsp;Y&nbsp;Z coordinates per frame, angle CSVs for knees, hips and elbows,
+    and a <b>3D stick figure movie</b> animating the joints with bones drawn between
+    them — shown as a three-quarter view alongside a side view rotated 90&deg;.
+    All axes are distances from the camera, so the figure moves through space.<br><br>
     <b>Note:</b> Processing takes 5&nbsp;–&nbsp;15&nbsp;minutes depending on video length.
     Keep this tab open while it runs.
   </div>
@@ -254,6 +259,7 @@ const pfill = document.getElementById('pfill');
 const pstage = document.getElementById('pstage');
 const ppct = document.getElementById('ppct');
 const dl   = document.getElementById('dl');
+const mdl  = document.getElementById('mdl');
 
 let chosen = null;
 
@@ -313,9 +319,15 @@ go.addEventListener('click', async () => {
         clearInterval(iv);
         spin.style.display = 'none';
         pwrap.className = 'pwrap';
-        setStatus('done', 'Done! Your coordinates are ready to download.');
+        setStatus('done', d.has_movie
+          ? 'Done! Coordinates and the 3D skeleton movie are ready.'
+          : 'Done! Your coordinates are ready to download.');
         dl.href = '/download/' + jobId;
         dl.className = 'dl-btn vis';
+        if (d.has_movie) {
+          mdl.href = '/movie/' + jobId;
+          mdl.className = 'dl-btn vis';
+        }
         go.disabled = false;
       } else if (d.status === 'error') {
         clearInterval(iv);
@@ -364,6 +376,7 @@ function fail(msg) {
 function reset() {
   st.className = 'status';
   dl.className = 'dl-btn';
+  mdl.className = 'dl-btn';
   pwrap.className = 'pwrap';
 }
 </script>
@@ -439,7 +452,8 @@ def status(job_id):
     if not job:
         return jsonify(error='unknown job'), 404
     return jsonify(status=job['status'], error=job.get('error'),
-                   percent=job.get('percent', 0), stage=job.get('stage', ''))
+                   percent=job.get('percent', 0), stage=job.get('stage', ''),
+                   has_movie=bool(job.get('movie')))
 
 
 @app.route('/download/<job_id>')
@@ -453,6 +467,21 @@ def download(job_id):
         as_attachment=True,
         download_name='gait_coordinates.zip',
         mimetype='application/zip',
+    )
+
+
+@app.route('/movie/<job_id>')
+def movie(job_id):
+    """The 3D stick figure MP4 on its own, so it can be watched without unzipping."""
+    with _lock:
+        job = dict(_jobs.get(job_id, {}))
+    if not job or job.get('status') != 'done' or not job.get('movie'):
+        return jsonify(error='movie not available'), 400
+    return send_file(
+        io.BytesIO(job['movie']),
+        as_attachment=True,
+        download_name=MOVIE_NAME,
+        mimetype='video/mp4',
     )
 
 
@@ -485,8 +514,11 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str) -> None:
         # output paths (charts/<session>/data/*.csv) land inside `work`.
         # The tracker swap works by injecting pipelandmark_rtmpose into
         # sys.modules['pipelandmark'] before calculateangle imports it.
+        data_rel = os.path.join('charts', session, 'data')
+        cam_rel = os.path.join(session, 'camera_matrix.csv')
+
         script_lines = [
-            'import sys',
+            'import sys, os',
             'import matplotlib; matplotlib.use("Agg")',  # headless server — no display
             f'sys.path.insert(0, {repr(GAIT_DIR)})',
         ]
@@ -498,6 +530,15 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str) -> None:
         script_lines += [
             'import calculateangle',
             f'calculateangle.main(folder={repr(session)})',
+            # Then the 3D stick figure, built from the CSVs just written.
+            # camera_matrix.csv repairs pipelandmark's intrinsics scaling, which
+            # otherwise makes the subject appear to rise while walking closer.
+            'import skeleton3d',
+            f'_lm = skeleton3d.load_landmarks({repr(data_rel)})',
+            f'_cam = {repr(cam_rel)}',
+            '_lm = skeleton3d.repair_intrinsics(_lm, _cam) '
+            'if os.path.exists(_cam) else _lm',
+            f'skeleton3d.render_movie(_lm, {repr(MOVIE_NAME)})',
         ]
         script = '; '.join(script_lines)
 
@@ -526,11 +567,11 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str) -> None:
         tail = collections.deque(maxlen=100)
         deadline = time.monotonic() + PIPELINE_TIMEOUT
         n_joints, cur_joint = 6, 0
-        # Tracking is a single pass over the video and dominates the runtime, so
-        # it owns most of the bar; the per-joint angle maths afterwards is quick.
-        # A fully cached session emits no @@FRAME at all, so the joints become
-        # the only thing left to measure.
-        TRACK_SHARE = 92
+        # Three phases share the bar: the single tracking pass over the video,
+        # the quick per-joint angle maths, then rendering the 3D movie. A fully
+        # cached session emits no @@FRAME, so the joints carry the first stretch.
+        TRACK_SHARE = 55
+        ANGLE_SHARE = 60
         tracked = False
 
         for raw in proc.stdout:
@@ -551,14 +592,24 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str) -> None:
                     frac, cur_name = line[8:].split(' ', 1)
                     cur_joint, n_joints = (int(v) for v in frac.split('/'))
                     if tracked:
-                        pct = TRACK_SHARE + (100 - TRACK_SHARE) * cur_joint / n_joints
+                        pct = TRACK_SHARE + (ANGLE_SHARE - TRACK_SHARE) \
+                            * cur_joint / n_joints
                         _set_progress(job_id, pct,
                                       f'Computing angles — {cur_name} '
                                       f'({cur_joint}/{n_joints})')
                     else:
-                        _set_progress(job_id, 100 * (cur_joint - 1) / n_joints,
+                        _set_progress(job_id, TRACK_SHARE * (cur_joint - 1) / n_joints,
                                       f'Loading cached joint {cur_joint}/{n_joints} '
                                       f'— {cur_name}')
+                except ValueError:
+                    pass
+            elif line.startswith('@@RENDER '):
+                try:
+                    done, total = (int(v) for v in line[9:].split('/'))
+                    if total:
+                        pct = ANGLE_SHARE + (98 - ANGLE_SHARE) * done / total
+                        _set_progress(job_id, pct,
+                                      f'Rendering 3D movie — frame {done}/{total}')
                 except ValueError:
                     pass
 
@@ -570,8 +621,8 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str) -> None:
         if proc.wait() != 0:
             raise RuntimeError('Pipeline failed:\n' + ''.join(tail)[-3000:])
 
-        # --- Bundle CSVs ---
-        _set_progress(job_id, 99, 'Bundling CSVs…')
+        # --- Bundle CSVs + movie ---
+        _set_progress(job_id, 99, 'Bundling results…')
         data_dir = os.path.join(work, 'charts', session, 'data')
         if not os.path.isdir(data_dir):
             raise RuntimeError(
@@ -579,16 +630,26 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str) -> None:
                 'Check that the video and LiDAR frames are valid.'
             )
 
+        movie_path = os.path.join(work, MOVIE_NAME)
+        movie = None
+        if os.path.exists(movie_path):
+            with open(movie_path, 'rb') as fh:
+                movie = fh.read()
+
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
             for name in sorted(os.listdir(data_dir)):
                 if name.endswith('.csv'):
                     zf.write(os.path.join(data_dir, name), name)
+            # Already-compressed video: storing it avoids a pointless deflate pass
+            if movie is not None:
+                zf.writestr(MOVIE_NAME, movie, compress_type=zipfile.ZIP_STORED)
         buf.seek(0)
 
         with _lock:
             _jobs[job_id] = {'status': 'done', 'result': buf.read(), 'error': None,
-                             'percent': 100, 'stage': 'Complete'}
+                             'percent': 100, 'stage': 'Complete',
+                             'movie': movie}
 
     except Exception as exc:
         with _lock:
