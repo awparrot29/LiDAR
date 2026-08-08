@@ -5,7 +5,8 @@ import matplotlib.pyplot as plt
 # Bumped whenever the coordinate geometry changes, so landmark caches written by
 # an older version are discarded instead of silently producing wrong output.
 # 1 = orientation-aware rotation + corrected intrinsics scaling.
-CACHE_SCHEMA = 1
+# 2 = per-joint depth averaged across neighbouring frames.
+CACHE_SCHEMA = 2
 # Map pivot body part to the three landmarks to calculate angle
 landmark_map = {
     "left elbow": ("left elbow", "left shoulder", "left wrist"),

@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 from rtmlib import Body, PoseTracker
 
+import depthsmooth
 import sessiongeom
 
 # COCO 17-keypoint indices used by RTMPose
@@ -84,8 +85,13 @@ def extract_all_landmarks(folder):
     print(f"Session recorded in {geom['orientation']}; "
           f"frame {width}x{height}, rotate={rotate}")
 
-    # One output array per landmark
-    arrays = {name: [] for name in landmark_map}
+    # First pass records the pixel each joint landed on and the raw depth there;
+    # the depths are then smoothed across neighbouring frames before being
+    # projected, so the projection uses the settled distance rather than a
+    # single noisy sample.
+    pix = {name: [] for name in landmark_map}       # (col, row) per frame
+    raw_z = {name: [] for name in landmark_map}     # metres, straight from LiDAR
+    ok_z = {name: [] for name in landmark_map}      # was the reading usable
     prev = {name: None for name in landmark_map}
 
     tracker = _make_tracker()
@@ -137,36 +143,59 @@ def extract_all_landmarks(folder):
                 conf = cv2.rotate(conf, cv2.ROTATE_90_CLOCKWISE)
         depth_meters = depth_mm / 1000.0
 
-        # Returns the 3d coordinate of a landmark if the LiDAR is confident
-        # enough there, otherwise reusing the previous frame's depth
-        def extract_one(name, idx):
+        # Record where each landmark sits and what the LiDAR reads there.
+        # Nothing is projected yet - that waits until the depths have been
+        # smoothed across frames.
+        def sample_one(name, idx):
             if kps is not None:
                 pos = (int(kps[idx][0]), int(kps[idx][1]))
                 prev[name] = pos
             else:
                 pos = prev[name]
 
-            if pos:
-                pointx = int(np.clip(pos[0], 0, width - 1))
-                pointy = int(np.clip(pos[1], 0, height - 1))
-                if frame_i == 0 or conf is None or conf[pointy, pointx] > 0:
-                    z = depth_meters[pointy, pointx]
-                else:
-                    # Fallback to previous frame's depth when LiDAR confidence is 0
-                    z = arrays[name][frame_i - 1][2]
-                x = (pointx - cx) * z / fx
-                y = (pointy - cy) * z / fy
-                return (x, y, z)
-            else:
+            if not pos:
                 print(f"No position for {name} at frame {frame_i}")
-                return (0, 0, 0)
+                return (0, 0), 0.0, False
+
+            pointx = int(np.clip(pos[0], 0, width - 1))
+            pointy = int(np.clip(pos[1], 0, height - 1))
+            z = float(depth_meters[pointy, pointx])
+            # A zero-confidence reading is excluded from the average rather than
+            # replaced by the previous frame, so it cannot drag its neighbours;
+            # smoothing fills the gap from both sides.
+            usable = z > 0 and (conf is None or conf[pointy, pointx] > 0)
+            return (pointx, pointy), z, usable
 
         for name, idx in landmark_map.items():
-            arrays[name].append(extract_one(name, idx))
+            p, z, usable = sample_one(name, idx)
+            pix[name].append(p)
+            raw_z[name].append(z)
+            ok_z[name].append(usable)
 
         frame_i += 1
 
     cap.release()
+
+    # Second pass: average each joint's depth over the neighbouring frames, then
+    # project. x and y are derived from the smoothed depth so all three stay
+    # consistent with one another.
+    print(f"Smoothing depth over {depthsmooth.DEFAULT_WINDOW} frames "
+          f"({frame_i} frames tracked)")
+
+    arrays = {}
+    for name in landmark_map:
+        z = depthsmooth.smooth_series(raw_z[name], ok_z[name],
+                                      depthsmooth.DEFAULT_WINDOW)
+        pts = []
+        for (pointx, pointy), zi in zip(pix[name], z):
+            if zi <= 0:
+                pts.append((0, 0, 0))
+                continue
+            pts.append(((pointx - cx) * zi / fx,
+                        (pointy - cy) * zi / fy,
+                        zi))
+        arrays[name] = pts
+
     return arrays
 
 
