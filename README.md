@@ -2,7 +2,63 @@
 
 This project analyzes human gait using RGB-D video from LiDAR-enabled iPhones/iPads, combining 3D pose estimation with depth data to detect trends in Parkinsonian gait.
 
+---
+
+# Quick Start &mdash; process a recording
+
+**`process_session.py` is the program to run.** Give it a zipped Stray Scanner
+session; it writes the joint coordinate spreadsheets and a 3D stick figure movie.
+
+```bash
+pip install -r requirements.txt
+
+python process_session.py my_session.zip
+```
+
+That is the whole workflow. Results land in `my_session_results/` beside the zip:
+
+| Output | What it is |
+|---|---|
+| 18 CSV files | X&nbsp;Y&nbsp;Z per frame for twelve joints, plus knee, hip and elbow angles |
+| `..._gait_skeleton_3d.mp4` | the tracked skeleton animated in 3D, three-quarter and side view |
+
+Progress is shown while it runs:
+
+```
+  [###########################-]  97.5%  rendering movie 430/436      ~0m05s left
+  Session recorded in landscape; frame 256x192, rotate=False
+  Background model built from 200 frames; camera drift 0.2 cm
+  Rejected 233 readings that were the background (4.5% of samples)
+```
+
+### Options
+
+| Flag | Purpose |
+|---|---|
+| `--tracker mediapipe` | pose model (default). Faster. |
+| `--tracker rtmpose` | RTMPose-m via ONNX Runtime. Different model, useful as a cross-check. |
+| `-o FOLDER` | where to write results |
+| `--no-movie` | spreadsheets only, skip the render |
+| `--keep-graphs` | also save the per-joint PNG graphs |
+| `--timeout N` | give up after N seconds (default 3600) |
+
+```bash
+python process_session.py my_session.zip -o results --tracker rtmpose
+```
+
+A 700-frame recording takes roughly four minutes on a laptop. Nothing needs to
+be copied into the repository first, and no folders are left behind &mdash; the zip
+is unpacked to a temporary directory that is removed afterwards.
+
+### Getting the zip off the iPad
+
+Record with **Stray Scanner** at **60 FPS**. In the **Files** app, find the
+session folder, long-press it and choose **Compress**. That `.zip` is the input.
+
+---
+
 ## Contents
+- [Quick Start](#quick-start--process-a-recording)
 - [Overview](#overview)
 - [Results](#results)
 - [Requirements](#requirements)
@@ -10,6 +66,7 @@ This project analyzes human gait using RGB-D video from LiDAR-enabled iPhones/iP
 - [Usage](#usage)
 - [Web App](#web-app)
 - [Device Orientation](#device-orientation)
+- [Denoising](#denoising)
 - [Pose Trackers](#pose-trackers)
 - [Interpreting the Output](#interpreting-the-output)
 - [General-LiDAR](#general-lidar)
@@ -44,32 +101,41 @@ Using the MediaPipe pose tracking along with LiDAR data, graphs are generated li
 <img src=sample-results/rightkneeangle.png width="350"> <img src=sample-results/Rightkneedetrended.png width="350">
 
 ## Requirements
-- Python 3.10 (recommended, as specified in env.yaml)
-- [Anaconda](https://www.anaconda.com/)
+- Python 3.10 or newer
 - iPhone 12 Pro+ or iPad Pro with LiDAR
 - [Stray Scanner](https://apps.apple.com/us/app/stray-scanner/id1557051662) app to record LiDAR data
+- [Anaconda](https://www.anaconda.com/) only if you want the Open3D point-cloud tools in `general-lidar/`
 
 ## Installation
 
-Make sure you have [Anaconda](https://www.anaconda.com/) installed. From the command line:
+```bash
+git clone https://github.com/awparrot29/LiDAR.git
+cd LiDAR
+pip install -r requirements.txt
+```
 
-1. Clone this repository:
+That covers [`process_session.py`](#quick-start--process-a-recording), the web
+app and everything in `gait-analysis/`.
 
-   ```bash
-   git clone https://github.com/daryllavin/LiDAR-Gait-Analysis.git
-   cd LiDAR-Gait-Analysis
-   ```
-   
-2. Create and activate the Conda environment:
+`env.yaml` describes the original Conda environment and is kept for the
+`general-lidar/` scripts, which need Open3D. **It predates the newer work and
+does not include `rtmlib`, `onnxruntime` or `imageio-ffmpeg`**, so the RTMPose
+tracker and the H.264 movie will not work from it alone. Use `requirements.txt`
+for anything in this README beyond the General-LiDAR section:
 
    ```bash
    conda env create -f env.yaml
    conda activate lidar-gait-analysis
+   pip install -r requirements.txt
    ```
 
-Then complete the steps listed in [Usage](#usage) below.
-
 ## Usage
+
+> This section describes running the individual scripts directly, which is how
+> the project began and is still how the `general-lidar/` tools work. For gait
+> analysis you no longer need any of it &mdash;
+> [`process_session.py`](#quick-start--process-a-recording) takes the zip
+> straight from the iPad and does the whole job.
 
 To utilize the LiDAR capabilities of the iPhone/iPad, you must have a LiDAR-equipped device (iPhone 12+ Pro/Pro Max, or iPad Pro).
 
@@ -173,6 +239,56 @@ thigh ~0.41 m).
 > ones. `calculateangle.py` stamps a schema number into each
 > `landmark_cache.npz` and discards caches written by an older version, since
 > some session ZIPs carry them.
+
+## Denoising
+
+Raw coordinates jerk about, because each joint's distance is a single number
+pulled from a 192&times;256 depth map. Two stages clean this up, applied
+automatically by `process_session.py` and the web app.
+
+**Background rejection** (`background.py`). A thin limb against a distant wall
+can fail to register, so the pixel under the landmark reports the scene behind
+the subject. That is not noise and no amount of averaging repairs it. The camera
+is stationary, so the scene is learned from the recording: for each pixel the
+background is the 90th percentile of its depth history, and a reading within
+50&nbsp;mm of it is marked untrusted.
+
+> The percentile must be high rather than the median. A median model is
+> contaminated wherever the subject lingers over a pixel &mdash; measured on
+> `park_sim`, it placed four of five test joints *behind* their own
+> "background". Rejected readings are marked untrusted rather than discarded;
+> discarding them left gaps that the filter turned into metre-scale artefacts.
+
+**Outlier-rejecting average** (`depthsmooth.py`). Each joint's depth is then
+averaged over nine frames (150&nbsp;ms), dropping samples more than two standard
+deviations from the window mean before averaging the rest, iteratively because
+one extreme value inflates the deviation enough to hide itself on a single pass.
+
+> The residual at the extremities is not steady noise but rare and violent:
+> kurtosis 47 at the ankle against 3.0 for a normal distribution. A plain mean
+> smears such a spike across the window instead of removing it. On a synthetic
+> 583&nbsp;mm spike the clipped mean leaves 1.9&nbsp;mm of error where a plain
+> nine-frame mean leaves 63&nbsp;mm.
+
+The window is centred, so constant-velocity motion passes through untouched and
+a 1&nbsp;Hz limb swing keeps 97% of its amplitude.
+
+Measured on `park_sim`, walking phase:
+
+| | before | after |
+|---|---|---|
+| jumps over 50&nbsp;mm in one frame | 153 | **17** |
+| worst ankle jump | 666&nbsp;mm | **113&nbsp;mm** |
+| ankle step per frame | 12.7&nbsp;mm | **7.2&nbsp;mm** |
+| knee-angle range | 85.3&deg; | 86.2&deg; *(signal not flattened)* |
+
+Every run prints what it rejected, so the cleaning is never silent.
+
+**Not tried and rejected:** sampling a 5&times;5 patch around each joint instead
+of one pixel. A forearm is only about five pixels wide at 2.4&nbsp;m, so the
+patch is mostly background and its median jumps to the wall &mdash; it put the
+wrist more than half a metre behind the torso in 5.7% of frames. Sampling stays
+at the single pixel.
 
 ## Pose Trackers
 
@@ -283,6 +399,8 @@ The gait-analysis folder contains 4 programs whose functionalities are described
 | pipelandmark.py   | Helper module for joint location extraction (not used on its own)         |
 | pipelandmark_rtmpose.py | Same helper backed by RTMPose instead of MediaPipe (not used on its own) |
 | sessiongeom.py    | Works out portrait vs landscape from imu.csv and derives the matching intrinsics |
+| background.py     | Learns the static scene so readings that are the wall or floor can be rejected |
+| depthsmooth.py    | Averages each joint's depth across frames, dropping outliers beyond two sigma |
 | skeleton3d.py     | Renders the 3D stick figure movie from the coordinate CSVs                 |
 
 **visualize.py**: This program displays the MediaPipe joint landmarks drawn onto the video, and saves it as an MP4.
