@@ -9,7 +9,9 @@ This project analyzes human gait using RGB-D video from LiDAR-enabled iPhones/iP
 - [Installation](#installation)
 - [Usage](#usage)
 - [Web App](#web-app)
+- [Device Orientation](#device-orientation)
 - [Pose Trackers](#pose-trackers)
+- [Interpreting the Output](#interpreting-the-output)
 - [General-LiDAR](#general-lidar)
 - [Gait-Analysis](#gait-analysis)
 
@@ -114,6 +116,20 @@ in a subprocess there, and bundles `charts/<session>/data/*.csv` into the
 response. Nothing is written to the repository and uploads are deleted once the
 job finishes.
 
+### What you get back
+
+- **A 3D stick figure movie**, played in the page as soon as it is ready. Two
+  panels: a three-quarter view and a side view turned 90&deg; about the vertical
+  axis, where travel in depth reads as left-to-right motion. Every axis is a
+  true distance from the camera, so the subject moves through the scene.
+- **The coordinate CSVs** — one per joint with X&nbsp;Y&nbsp;Z per frame, plus
+  angle CSVs for knees, hips and elbows.
+
+The movie is downloadable on its own, and is also included in the results ZIP.
+It is encoded H.264 through `imageio-ffmpeg`'s bundled libx264 rather than
+OpenCV's `mp4v`, because no browser will play MPEG-4 Part 2 in a `<video>`
+element. That also cuts a typical clip from ~2.9&nbsp;MB to ~0.24&nbsp;MB.
+
 ### Deploying to Azure App Service
 
 The app runs on a Free (F1) Linux Python 3.11 plan. Two deployment details are
@@ -131,6 +147,32 @@ easy to get wrong:
 
 `GET /healthz` reports the import status of every native dependency, which is
 the quickest way to verify a deployment.
+
+## Device Orientation
+
+The RGB video is always stored landscape (1920x1440) no matter how the device
+was held. A session shot in **portrait** therefore has the subject lying
+sideways in the raw frames and needs a 90&deg; rotation to stand them up; a
+session shot in **landscape** is already upright and must not be rotated.
+Rotating one anyway lays the skeleton on its side, so it appears to stand on a
+wall.
+
+`sessiongeom.py` decides which case applies from the gravity vector in
+`imu.csv` — gravity sits on the device *y* axis in portrait and the *x* axis in
+landscape. Units differ between Stray Scanner versions, so only the dominant
+axis is used. A session with no usable `imu.csv` is assumed portrait, matching
+how everything recorded before this check was handled.
+
+The same module derives the camera intrinsics for the frame the tracker works
+in. The two cannot be separated, because the rotation swaps the x and y axes of
+the camera matrix. Both orientations place the principal point at the centre of
+the frame, giving anatomically sensible measurements (shoulder width ~0.35 m,
+thigh ~0.41 m).
+
+> Coordinates exported before this was added are **not comparable** with newer
+> ones. `calculateangle.py` stamps a schema number into each
+> `landmark_cache.npz` and discards caches written by an older version, since
+> some session ZIPs carry them.
 
 ## Pose Trackers
 
@@ -161,6 +203,34 @@ it once and slices out the joints it needs. Earlier versions called
 `extract_landmarks()` once per joint, re-running the whole video six times;
 avoiding that cut a 458-frame session from 424 s to 111 s. `extract_landmarks()`
 is still available as a wrapper for the three-landmark call style.
+
+## Interpreting the Output
+
+**Limbs pointing at the camera are foreshortened.** One depth sample is taken
+per joint, and that sample is the body's *front surface*, not the joint centre.
+When a limb runs along the viewing axis its two ends return almost the same
+depth, so the limb collapses.
+
+This shows up clearly during the sit-to-stand at the start of a recording, where
+the thighs point straight at the camera. Measured on `park_sim`:
+
+| | seated / standing up | walking |
+|---|---|---|
+| torso lean, p95 | 24.6&deg; | 4.9&deg; |
+| torso length | 0.39 m (0.33&ndash;0.54) | 0.53 m (IQR 0.02) |
+| thigh length | 0.20 m | 0.34 m |
+
+A thigh of 0.20 m is 40% short. The walking segment is stable and trustworthy;
+the seated segment mixes genuine trunk flexion — you must lean forward to rise
+from a chair — with unreliable geometry, and should not be used quantitatively.
+
+A quick sanity check on any session: bone lengths should stay roughly constant
+over time. Where they do not, the joints in question are unreliable for those
+frames.
+
+**Depth is the trustworthy axis.** `z` is read straight from the LiDAR map and
+is accurate to 1&ndash;2%. X and Y are reconstructed through the camera model
+and depend on the intrinsics being right for the session's orientation.
 
 ## General-LiDAR
 
@@ -212,6 +282,8 @@ The gait-analysis folder contains 4 programs whose functionalities are described
 | detrend.py        | Plots joint movement over time, removes trendline for better insight        |
 | pipelandmark.py   | Helper module for joint location extraction (not used on its own)         |
 | pipelandmark_rtmpose.py | Same helper backed by RTMPose instead of MediaPipe (not used on its own) |
+| sessiongeom.py    | Works out portrait vs landscape from imu.csv and derives the matching intrinsics |
+| skeleton3d.py     | Renders the 3D stick figure movie from the coordinate CSVs                 |
 
 **visualize.py**: This program displays the MediaPipe joint landmarks drawn onto the video, and saves it as an MP4.
 
