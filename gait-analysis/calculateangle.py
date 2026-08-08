@@ -6,7 +6,9 @@ import matplotlib.pyplot as plt
 # an older version are discarded instead of silently producing wrong output.
 # 1 = orientation-aware rotation + corrected intrinsics scaling.
 # 2 = per-joint depth averaged across neighbouring frames.
-CACHE_SCHEMA = 2
+# 3 = 9-frame window, outliers beyond 2 sigma dropped, background readings
+#     rejected before averaging.
+CACHE_SCHEMA = 3
 # Map pivot body part to the three landmarks to calculate angle
 landmark_map = {
     "left elbow": ("left elbow", "left shoulder", "left wrist"),

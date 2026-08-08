@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import mediapipe as mp
 
+import background
 import depthsmooth
 import sessiongeom
 
@@ -78,6 +79,21 @@ def extract_all_landmarks(folder):
     ok_z = {name: [] for name in landmark_map}      # was the reading usable
     prev = {name: None for name in landmark_map}
 
+    # Learn the static scene so readings that are actually the wall or floor can
+    # be thrown out before any averaging happens.
+    bg_model = background.build_model(depth_folder, depth_files, rotate)
+    drift = background.camera_drift(folder)
+    if bg_model is None:
+        print("No background model (too few depth frames); "
+              "background rejection disabled")
+    else:
+        print(f"Background model built from {min(len(depth_files), background.MAX_MODEL_FRAMES)} frames"
+              + (f"; camera drift {drift*100:.1f} cm" if drift is not None else ""))
+        if drift is not None and drift > background.DRIFT_WARN_M:
+            print(f"Warning: camera moved {drift*100:.0f} cm during the recording, "
+                  f"so the background model may be unreliable.")
+    n_bg_rejected = {name: 0 for name in landmark_map}
+
     # Pose estimation setup
     mp_pose = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
@@ -147,10 +163,15 @@ def extract_all_landmarks(folder):
                 pointx = int(np.clip(pos[0], 0, width - 1))
                 pointy = int(np.clip(pos[1], 0, height - 1))
                 z = float(depth_meters[pointy, pointx])
-                # A zero-confidence reading is excluded from the average rather
-                # than replaced by the previous frame, so it cannot drag its
+                # An unusable reading is excluded from the average rather than
+                # replaced by the previous frame, so it cannot drag its
                 # neighbours; smoothing fills the gap from both sides.
                 usable = z > 0 and (conf is None or conf[pointy, pointx] > 0)
+                # The landmark can sit on a limb the depth map failed to
+                # register, in which case the pixel reports the scene behind it.
+                if usable and background.is_background(bg_model, z, pointx, pointy):
+                    n_bg_rejected[name] += 1
+                    usable = False
                 return (pointx, pointy), z, usable
 
             for name, idx in landmark_map.items():
@@ -169,6 +190,12 @@ def extract_all_landmarks(folder):
     n_used = sum(1 for v in ok_z[next(iter(ok_z))])
     print(f"Smoothing depth over {depthsmooth.DEFAULT_WINDOW} frames "
           f"({n_used} frames tracked)")
+    total_rejected = sum(n_bg_rejected.values())
+    if total_rejected:
+        worst = max(n_bg_rejected.items(), key=lambda kv: kv[1])
+        print(f"Rejected {total_rejected} readings that were the background "
+              f"({100*total_rejected/(n_used*len(landmark_map)):.1f}% of samples; "
+              f"most affected: {worst[0]}, {worst[1]})")
 
     arrays = {}
     for name in landmark_map:
