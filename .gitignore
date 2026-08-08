@@ -14,6 +14,10 @@ park_sim/
 *.zip
 *.ply
 
+# The one exception: the anonymised sample recording shipped for demonstration.
+# Its faces are blurred by anonymize_session.py; raw sessions stay out.
+!example/*.zip
+
 # Pipeline output
 charts/
 

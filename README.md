@@ -12,10 +12,15 @@ session; it writes the joint coordinate spreadsheets and a 3D stick figure movie
 ```bash
 pip install -r requirements.txt
 
+# try it immediately on the recording included in this repository
+python process_session.py example/sample_session.zip
+
+# or on your own
 python process_session.py my_session.zip
 ```
 
-That is the whole workflow. Results land in `my_session_results/` beside the zip:
+That is the whole workflow. Results land in a `<name>_results/` folder beside
+the zip:
 
 | Output | What it is |
 |---|---|
@@ -54,6 +59,23 @@ is unpacked to a temporary directory that is removed afterwards.
 
 Record with **Stray Scanner** at **60 FPS**. In the **Files** app, find the
 session folder, long-press it and choose **Compress**. That `.zip` is the input.
+
+No device to hand? [`example/sample_session.zip`](example/) is a complete
+recording ready to run &mdash; a subject rising from a chair and walking toward
+the camera.
+
+### Sharing a recording
+
+Recordings identify whoever was filmed. Blur the face before passing one on:
+
+```bash
+python anonymize_session.py my_session.zip -o shareable.zip
+```
+
+The head is tracked through the whole recording and obscured in every frame,
+while the depth and confidence maps pass through untouched. Measured on the
+example, this shifts the tracked joints by 6&ndash;15&nbsp;mm, inside the
+measurement noise, so an anonymised recording still analyses the same.
 
 ---
 
