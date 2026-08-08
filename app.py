@@ -243,6 +243,7 @@ HTML = r"""<!doctype html>
     <video id="vid" controls autoplay loop muted playsinline preload="auto"></video>
   </div>
 
+  <a class="dl-btn" id="mdl" download>&#8595; Download 3D Movie (MP4)</a>
   <a class="dl-btn" id="dl">&#8595; Download Results (ZIP: CSVs + 3D movie)</a>
 
   <div class="hint">
@@ -274,6 +275,7 @@ const pfill = document.getElementById('pfill');
 const pstage = document.getElementById('pstage');
 const ppct = document.getElementById('ppct');
 const dl   = document.getElementById('dl');
+const mdl  = document.getElementById('mdl');
 const player = document.getElementById('player');
 const vid  = document.getElementById('vid');
 
@@ -336,12 +338,15 @@ go.addEventListener('click', async () => {
         spin.style.display = 'none';
         pwrap.className = 'pwrap';
         setStatus('done', d.has_movie
-          ? 'Done! Coordinates and the 3D skeleton movie are ready.'
+          ? 'Done! The 3D skeleton is playing below.'
           : 'Done! Your coordinates are ready to download.');
         dl.href = '/download/' + jobId;
         dl.className = 'dl-btn vis';
         if (d.has_movie) {
-          mdl.href = '/movie/' + jobId;
+          vid.src = '/movie/' + jobId;
+          player.className = 'player vis';
+          // ?download=1 makes the server send the same file as an attachment
+          mdl.href = '/movie/' + jobId + '?download=1';
           mdl.className = 'dl-btn vis';
         }
         go.disabled = false;
@@ -394,6 +399,12 @@ function reset() {
   dl.className = 'dl-btn';
   mdl.className = 'dl-btn';
   pwrap.className = 'pwrap';
+  // Stop and unload the previous run's video, otherwise it keeps playing
+  // underneath while the next upload is processing
+  player.className = 'player';
+  vid.pause();
+  vid.removeAttribute('src');
+  vid.load();
 }
 </script>
 </body>
@@ -488,7 +499,12 @@ def download(job_id):
 
 @app.route('/movie/<job_id>')
 def movie(job_id):
-    """The 3D stick figure MP4, served inline so the page can play it directly."""
+    """The 3D stick figure MP4.
+
+    Served inline by default so the page can play it in a <video> element;
+    ?download=1 switches to an attachment so the same file can be saved without
+    unzipping the results bundle.
+    """
     with _lock:
         job = dict(_jobs.get(job_id, {}))
     if not job or job.get('status') != 'done' or not job.get('movie'):
@@ -498,6 +514,7 @@ def movie(job_id):
         io.BytesIO(job['movie']),
         mimetype='video/mp4',
         download_name=MOVIE_NAME,
+        as_attachment=request.args.get('download') == '1',
         conditional=True,
     )
 
