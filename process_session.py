@@ -26,8 +26,10 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GAIT_DIR = os.path.join(HERE, "gait-analysis")
+MOTION_DIR = os.path.join(HERE, "motion-analysis")
 MOVIE_NAME = "gait_skeleton_3d.mp4"
 TRACKERS = ("mediapipe", "rtmpose")
+KINDS = ("auto", "torso", "hand")
 
 
 def extract_all(zf, dest_root):
@@ -75,7 +77,54 @@ def check_tracker(tracker):
               "Or use the MediaPipe tracker:  --tracker mediapipe")
 
 
-def build_script(session, tracker, want_movie):
+def detect_kind(session_path):
+    """Ask motion-analysis whether this is a torso or a hand recording.
+
+    Run in its own process because it loads MediaPipe. Falls back to torso if
+    anything goes wrong, since that is the long-standing behaviour.
+    """
+    src = "; ".join([
+        "import sys",
+        f"sys.path.insert(0, {MOTION_DIR!r})",
+        "import detect",
+        f"k, ev = detect.detect({session_path!r})",
+        'print("@@KIND " + k)',
+        "print(detect.explain(ev))",
+    ])
+    r = subprocess.run([sys.executable, "-c", src], capture_output=True, text=True)
+    kind, why = "torso", ""
+    for ln in (r.stdout or "").splitlines():
+        if ln.startswith("@@KIND "):
+            kind = ln[7:].strip()
+        elif ln.strip():
+            why = ln.strip()
+    return (kind if kind in ("torso", "hand") else "torso"), why
+
+
+def build_script(session, tracker, want_movie, kind="torso"):
+    if kind == "hand":
+        # One engine handles both subjects; motion-analysis writes data/ under
+        # the folder it is given, so charts/<session> puts the CSVs exactly
+        # where the rest of this script already looks for them.
+        out_rel = os.path.join("charts", session)
+        lines = [
+            "import sys, os",
+            'import matplotlib; matplotlib.use("Agg")',
+            f"sys.path.insert(0, {MOTION_DIR!r})",
+            "import extract, angles, profiles",
+            '_p = profiles.get("hand")',
+            f'_a, _g = extract.extract_all_landmarks({session!r}, kind="hand")',
+            "_ang = angles.compute(_a, _p)",
+            f"angles.write(_a, _ang, _p, {out_rel!r}, fps=60.0, graphs=True)",
+        ]
+        if want_movie:
+            lines += ["import skeleton3d as _s3",
+                      f"_s3.render(_a, _p, {MOVIE_NAME!r}, fps=60.0)"]
+        return "; ".join(lines)
+    return _build_torso_script(session, tracker, want_movie)
+
+
+def _build_torso_script(session, tracker, want_movie):
     data_rel = os.path.join("charts", session, "data")
     lines = [
         "import sys, os",
@@ -166,6 +215,9 @@ def main(argv=None):
     p.add_argument("zip", help="the zipped Stray Scanner session folder")
     p.add_argument("-o", "--out", default=None,
                    help="output folder (default: <zip name>_results beside the zip)")
+    p.add_argument("--kind", choices=KINDS, default="auto",
+                   help="subject: torso, hand, or auto-detect from the "
+                        "recording (default)")
     p.add_argument("--tracker", choices=TRACKERS, default="mediapipe",
                    help="pose model: mediapipe (default, faster) or rtmpose "
                         "(RTMPose-m via ONNX Runtime)")
@@ -185,7 +237,11 @@ def main(argv=None):
     if not os.path.isdir(GAIT_DIR):
         raise SystemExit(f"Cannot find the gait-analysis modules at {GAIT_DIR}")
 
-    check_tracker(args.tracker)
+    # RTMPose is a torso-only model, so a hand run must not be blocked by it
+    # being unavailable. An explicit --kind hand skips the check outright; an
+    # auto run cannot know the subject yet, so it is checked after detection.
+    if args.kind != "hand":
+        check_tracker(args.tracker)
 
     base = os.path.splitext(os.path.basename(args.zip))[0]
     out_dir = args.out or os.path.join(
@@ -206,14 +262,21 @@ def main(argv=None):
                 "No Stray Scanner session found in the ZIP.\n"
                 "Expected a folder containing rgb.mp4, camera_matrix.csv, "
                 "depth/ and confidence/.")
+        kind = args.kind
+        if kind == "auto":
+            kind, why = detect_kind(os.path.join(work, session))
+            if not args.quiet and why:
+                print(f"  {why}")
         if not args.quiet:
             label = session if session != "." else os.path.basename(base)
-            print(f"Session: {label}   tracker: {args.tracker}")
+            # RTMPose is a torso-only model, so do not claim it for a hand run
+            tr = args.tracker if kind == "torso" else "mediapipe (hand)"
+            print(f"Session: {label}   subject: {kind}   tracker: {tr}")
 
         os.chdir(work)
         proc = subprocess.Popen(
             [sys.executable, "-u", "-c",
-             build_script(session, args.tracker, not args.no_movie)],
+             build_script(session, args.tracker, not args.no_movie, kind)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
         bar = Progress(args.quiet)

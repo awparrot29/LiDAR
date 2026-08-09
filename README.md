@@ -11,6 +11,8 @@ recording of finger movement. See [Torso vs Hand](#torso-vs-hand).
 
 **`process_session.py` is the program to run.** Give it a zipped Stray Scanner
 session; it writes the joint coordinate spreadsheets and a 3D stick figure movie.
+It handles both a **torso** recording of someone walking and a close-up **hand**
+recording, detecting which from the recording unless you pass `--kind`.
 
 ```bash
 pip install -r requirements.txt
@@ -43,8 +45,11 @@ Progress is shown while it runs:
 
 | Flag | Purpose |
 |---|---|
-| `--tracker mediapipe` | pose model (default). Faster. |
-| `--tracker rtmpose` | RTMPose-m via ONNX Runtime. Different model, useful as a cross-check. |
+| `--kind auto` | subject: detect torso or hand from the recording (default). See [Torso vs Hand](#torso-vs-hand). |
+| `--kind torso` | force a walking/torso recording &mdash; 12 joints, 6 angles |
+| `--kind hand` | force a close-up hand recording &mdash; 21 joints, 15 angles |
+| `--tracker mediapipe` | pose model (default). Faster. Torso only. |
+| `--tracker rtmpose` | RTMPose-m via ONNX Runtime. Different model, useful as a cross-check. Torso only. |
 | `-o FOLDER` | where to write results |
 | `--no-movie` | spreadsheets only, skip the render |
 | `--keep-graphs` | also save the per-joint PNG graphs |
@@ -52,6 +57,7 @@ Progress is shown while it runs:
 
 ```bash
 python process_session.py my_session.zip -o results --tracker rtmpose
+python process_session.py hand_session.zip -o results --kind hand
 ```
 
 A 700-frame recording takes roughly four minutes on a laptop. Nothing needs to
@@ -225,10 +231,13 @@ tracker row greys out for a hand, because RTMPose is a torso-only model.
 With the **standalone script**, pass `--kind`:
 
 ```bash
-python motion-analysis/process_session.py session.zip            # auto-detect
-python motion-analysis/process_session.py session.zip --kind hand
-python motion-analysis/process_session.py session.zip --kind torso
+python process_session.py session.zip              # auto-detect
+python process_session.py session.zip --kind hand
+python process_session.py session.zip --kind torso
 ```
+
+`motion-analysis/process_session.py` is the same thing without the zip handling
+and progress bar, if you would rather point it straight at an unpacked folder.
 
 ### Two differences that are not preferences
 
