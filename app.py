@@ -21,6 +21,7 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2 GB
 
 GAIT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gait-analysis')
+MOTION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'motion-analysis')
 PIPELINE_TIMEOUT = 3000  # seconds
 MOVIE_NAME = 'gait_skeleton_3d.mp4'
 
@@ -98,6 +99,9 @@ HTML = r"""<!doctype html>
   .drop-label b { color: var(--text); }
   .fname { font-size: .8rem; color: var(--success); margin-top: .4rem; word-break: break-all; }
 
+  .opt-label { font-size: .78rem; letter-spacing: .04em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: .4rem; }
+  .tracker-row.disabled { opacity: .45; pointer-events: none; }
   /* Tracker selector */
   .tracker-row { display: flex; gap: .625rem; margin-bottom: 1.125rem; }
   .t-opt {
@@ -215,8 +219,29 @@ HTML = r"""<!doctype html>
     <input type="file" id="file" accept=".zip" style="display:none">
   </div>
 
-  <!-- Tracker choice -->
-  <div class="tracker-row">
+  <!-- Subject: torso or hand -->
+  <div class="opt-label">Subject</div>
+  <div class="tracker-row" id="subject-row">
+    <label class="t-opt selected">
+      <input type="radio" name="subject" value="auto" checked>
+      <div class="t-name">Auto-detect</div>
+      <div class="t-desc">Decides from the recording</div>
+    </label>
+    <label class="t-opt">
+      <input type="radio" name="subject" value="torso">
+      <div class="t-name">Torso</div>
+      <div class="t-desc">Walking · 12 joints</div>
+    </label>
+    <label class="t-opt">
+      <input type="radio" name="subject" value="hand">
+      <div class="t-name">Hand</div>
+      <div class="t-desc">Close-up · 21 joints</div>
+    </label>
+  </div>
+
+  <!-- Tracker choice (torso only) -->
+  <div class="opt-label" id="tracker-label">Tracker</div>
+  <div class="tracker-row" id="tracker-row">
     <label class="t-opt selected" id="lbl-mp">
       <input type="radio" name="tracker" value="mediapipe" checked>
       <div class="t-name">MediaPipe</div>
@@ -300,13 +325,30 @@ function pick(f) {
 }
 
 document.querySelectorAll('.t-opt').forEach(o => o.addEventListener('click', () => {
-  document.querySelectorAll('.t-opt').forEach(x => x.classList.remove('selected'));
+  // selection is per row, so the subject and tracker groups stay independent
+  const row = o.closest('.tracker-row');
+  row.querySelectorAll('.t-opt').forEach(x => x.classList.remove('selected'));
   o.classList.add('selected');
+  syncTracker();
 }));
+
+// RTMPose only exists for the torso pipeline, so hide the choice for a hand.
+function syncTracker() {
+  const subj = document.querySelector('input[name="subject"]:checked').value;
+  const row = document.getElementById('tracker-row');
+  const lbl = document.getElementById('tracker-label');
+  const off = (subj === 'hand');
+  row.classList.toggle('disabled', off);
+  lbl.textContent = off ? 'Tracker (torso only)' : 'Tracker';
+  document.getElementById('go').textContent =
+    subj === 'hand' ? 'Analyze Hand' : (subj === 'torso' ? 'Analyze Gait' : 'Analyze');
+}
+syncTracker();
 
 go.addEventListener('click', async () => {
   if (!chosen) return;
   const tracker = document.querySelector('input[name="tracker"]:checked').value;
+  const subject = document.querySelector('input[name="subject"]:checked').value;
   go.disabled = true;
   setStatus('proc', 'Uploading…');
   dl.className = 'dl-btn';
@@ -314,6 +356,7 @@ go.addEventListener('click', async () => {
   const form = new FormData();
   form.append('session', chosen);
   form.append('tracker', tracker);
+  form.append('subject', subject);
 
   let jobId;
   try {
@@ -461,6 +504,12 @@ def upload():
     if tracker not in ('mediapipe', 'rtmpose'):
         tracker = 'mediapipe'
 
+    # 'auto' lets motion-analysis decide from the recording; lower-body
+    # visibility separates a walking subject from a hand close-up cleanly.
+    subject = request.form.get('subject', 'auto')
+    if subject not in ('auto', 'torso', 'hand'):
+        subject = 'auto'
+
     job_id = str(uuid.uuid4())
     zip_bytes = f.read()
 
@@ -468,7 +517,7 @@ def upload():
         _jobs[job_id] = {'status': 'processing', 'result': None, 'error': None,
                          'percent': 0, 'stage': 'Queued…'}
 
-    threading.Thread(target=_run_job, args=(job_id, zip_bytes, tracker), daemon=True).start()
+    threading.Thread(target=_run_job, args=(job_id, zip_bytes, tracker, subject), daemon=True).start()
     return jsonify(job_id=job_id)
 
 
@@ -523,7 +572,8 @@ def movie(job_id):
 # Background processing
 # ---------------------------------------------------------------------------
 
-def _run_job(job_id: str, zip_bytes: bytes, tracker: str) -> None:
+def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
+             subject: str = 'auto') -> None:
     work = tempfile.mkdtemp(prefix='lidar_')
     try:
         # --- Extract ZIP ---
@@ -543,6 +593,33 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str) -> None:
                 'Expected contents: rgb.mp4, camera_matrix.csv, depth/, confidence/'
             )
 
+        # --- Decide torso or hand ---
+        # Run detection in its own process: it loads MediaPipe, which we do not
+        # want resident in the web worker. Lower-body visibility separates a
+        # walking subject (0.99) from a hand close-up (0.00) cleanly.
+        if subject == 'auto':
+            _set_progress(job_id, 0, 'Detecting subject…')
+            probe_src = '; '.join([
+                'import sys, os',
+                f'sys.path.insert(0, {repr(MOTION_DIR)})',
+                'import detect',
+                f'k, ev = detect.detect(os.path.join({repr(work)}, {repr(session)}))',
+                'print("@@KIND " + k)',
+                'print(detect.explain(ev))',
+            ])
+            pr = subprocess.run([sys.executable, '-c', probe_src],
+                                capture_output=True, text=True, cwd=work)
+            kind = 'torso'
+            for ln in (pr.stdout or '').splitlines():
+                if ln.startswith('@@KIND '):
+                    kind = ln[7:].strip()
+            if kind not in ('torso', 'hand'):
+                kind = 'torso'
+            app.logger.info('subject auto-detected as %s; %s', kind,
+                            (pr.stdout or '').replace('\n', ' ').strip())
+        else:
+            kind = subject
+
         # --- Build pipeline script ---
         # We run calculateangle in a subprocess so CWD is `work` and relative
         # output paths (charts/<session>/data/*.csv) land inside `work`.
@@ -550,6 +627,25 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str) -> None:
         # sys.modules['pipelandmark'] before calculateangle imports it.
         data_rel = os.path.join('charts', session, 'data')
         cam_rel = os.path.join(session, 'camera_matrix.csv')
+
+        if kind == 'hand':
+            # motion-analysis writes data/ under the folder it is given, so
+            # pointing it at charts/<session> puts the CSVs exactly where the
+            # bundling step below already looks for them.
+            out_rel = os.path.join('charts', session)
+            script = '; '.join([
+                'import sys, os',
+                'import matplotlib; matplotlib.use("Agg")',
+                f'sys.path.insert(0, {repr(MOTION_DIR)})',
+                'import extract, angles, profiles, skeleton3d',
+                '_p = profiles.get("hand")',
+                f'_a, _geom = extract.extract_all_landmarks({repr(session)}, kind="hand")',
+                '_ang = angles.compute(_a, _p)',
+                f'angles.write(_a, _ang, _p, {repr(out_rel)}, fps=60.0, graphs=True)',
+                f'skeleton3d.render(_a, _p, {repr(MOVIE_NAME)}, fps=60.0)',
+            ])
+        else:
+            script = None
 
         script_lines = [
             'import sys, os',
@@ -573,10 +669,12 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str) -> None:
             f'_lm = skeleton3d.load_landmarks({repr(data_rel)})',
             f'skeleton3d.render_movie(_lm, {repr(MOVIE_NAME)})',
         ]
-        script = '; '.join(script_lines)
+        if script is None:
+            script = '; '.join(script_lines)
 
         # Fail with something actionable rather than an ImportError traceback.
-        if tracker == 'rtmpose':
+        # RTMPose is a torso-only tracker, so a hand job never needs the probe.
+        if tracker == 'rtmpose' and kind != 'hand':
             probe = subprocess.run([sys.executable, '-c', 'import rtmlib'],
                                    capture_output=True, text=True)
             if probe.returncode != 0:
@@ -587,7 +685,7 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str) -> None:
 
         # Stream the child's output so @@JOINT / @@FRAME markers can drive the
         # progress bar. -u keeps the pipe unbuffered so they arrive live.
-        _set_progress(job_id, 0, 'Starting pose estimation…')
+        _set_progress(job_id, 0, f'Starting {kind} pose estimation…')
         proc = subprocess.Popen(
             [sys.executable, '-u', '-c', script],
             cwd=work,
@@ -599,7 +697,7 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str) -> None:
 
         tail = collections.deque(maxlen=100)
         deadline = time.monotonic() + PIPELINE_TIMEOUT
-        n_joints, cur_joint = 6, 0
+        n_joints, cur_joint = (15 if kind == 'hand' else 6), 0
         # Three phases share the bar: the single tracking pass over the video,
         # the quick per-joint angle maths, then rendering the 3D movie. A fully
         # cached session emits no @@FRAME, so the joints carry the first stretch.
