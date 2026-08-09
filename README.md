@@ -1,6 +1,9 @@
 # LiDAR Gait Analysis
 
-This project analyzes human gait using RGB-D video from LiDAR-enabled iPhones/iPads, combining 3D pose estimation with depth data to detect trends in Parkinsonian gait.
+This project analyzes Parkinsonian movement using RGB-D video from LiDAR-enabled
+iPhones/iPads, combining 3D pose estimation with depth data. It handles two kinds
+of recording: a **torso** recording of someone walking, and a close-up **hand**
+recording of finger movement. See [Torso vs Hand](#torso-vs-hand).
 
 ---
 
@@ -86,6 +89,7 @@ measurement noise, so an anonymised recording still analyses the same.
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Usage](#usage)
+- [Torso vs Hand](#torso-vs-hand)
 - [Web App](#web-app)
 - [Device Orientation](#device-orientation)
 - [Denoising](#denoising)
@@ -182,7 +186,89 @@ To run a [gait-analysis](#gait-analysis) program (ex. detrend.py), ensure you ar
    python3.10 gait-analysis/detrend.py
    ```
 
+## Torso vs Hand
+
+Two kinds of recording are supported, and the pipeline handles both.
+
+| | Torso | Hand |
+|---|---|---|
+| what it records | someone walking | a close-up of one hand |
+| pose model | MediaPipe Pose | MediaPipe Hands |
+| landmarks | 12 (shoulders, elbows, wrists, hips, knees, ankles) | 21 (wrist plus four joints per finger) |
+| angles | 6 &mdash; elbows, hips, knees | 15 &mdash; three flexion angles per finger |
+| tracker choice | MediaPipe or RTMPose | MediaPipe only |
+| typical distance | 1.5&ndash;4 m | 0.2&ndash;0.5 m |
+
+### Choosing
+
+Both the web app and the standalone script **detect the subject automatically**,
+and either lets you override it.
+
+Detection uses lower-body visibility, which separates the two cleanly &mdash; measured
+across every recording in this project:
+
+| recording | nearest object | lower-body visibility | detected as |
+|---|---|---|---|
+| hand close-up | 203 mm | 0.00 | hand |
+| park_sim | 1517 mm | 0.99 | torso |
+| Jul_30 | 1360 mm | 0.99 | torso |
+| Test3 (iPhone) | 1850 mm | 0.99 | torso |
+
+There is no overlap, so the choice is not delicate. The evidence is logged on
+every run, so a wrong call is visible rather than silent. Note that *hand
+detection rate* is a poor signal on its own &mdash; MediaPipe finds a hand on the
+walking subject 36&ndash;55% of the time &mdash; so it is only used as a tie-breaker.
+
+On the **web app**, pick Auto-detect, Torso or Hand above the tracker choice. The
+tracker row greys out for a hand, because RTMPose is a torso-only model.
+
+With the **standalone script**, pass `--kind`:
+
+```bash
+python motion-analysis/process_session.py session.zip            # auto-detect
+python motion-analysis/process_session.py session.zip --kind hand
+python motion-analysis/process_session.py session.zip --kind torso
+```
+
+### Two differences that are not preferences
+
+**Background rejection is on for torso, off for hand.** The background model learns
+the persistent depth at each pixel, which identifies the static scene only when the
+subject moves *through* it. A hand held in a close-up stays put, so it becomes the
+persistent content and the model learns the hand itself as background. Measured on
+a good hand recording, leaving it on rejected 40.9% of samples &mdash; including all
+449 wrist readings &mdash; and cut usable depth from 79.4% to 38.4%.
+
+**A depth-extent limit replaces it for hands.** A hand is only about 20 cm across,
+so no joint can sit 25 cm in depth away from the rest of it; a fingertip that
+samples the wall behind it lands outside that extent and is discarded. Without
+this, a single bad fingertip was thrown metres away, dragging one bone across the
+whole stick figure. The torso limit is a permissive 1.5 m, because a walking
+person's limbs genuinely span depth.
+
+### Checking a hand recording is usable
+
+Watch the **usable depth** percentage. Two of three hand recordings taken for this
+project were silently defective: their ARKit confidence channel was zero
+everywhere and the depth read 2.4&ndash;3.7x too far, while looking perfect to the eye
+&mdash; the crisp outline in a depth map comes from the RGB image, not the sensor. The
+confidence gate catches this, rejecting every sample from both. A near-zero figure
+means re-record. Healthy figures are around 79% for both subjects.
+
+### Known limitation: feet
+
+Feet are deliberately excluded. The heel and toe landmarks land only 5.5&ndash;7.6 px
+apart, giving a foot length of 8&ndash;10 cm against a real ~25 cm, and LiDAR does not
+rescue it because the bottleneck is the 2D landmark spacing rather than the depth.
+Including them would produce numbers that look real and are not.
+
+---
+
 ## Web App
+
+The upload page now has a **Subject** choice above the tracker: Auto-detect,
+Torso or Hand. See [Torso vs Hand](#torso-vs-hand). The tracker row greys out
+for a hand recording, because RTMPose is a torso-only model.
 
 `app.py` wraps the gait-analysis pipeline in a Flask web app so a session can be
 processed without a local Python environment. Upload a zipped Stray Scanner
@@ -369,6 +455,19 @@ frames.
 **Depth is the trustworthy axis.** `z` is read straight from the LiDAR map and
 is accurate to 1&ndash;2%. X and Y are reconstructed through the camera model
 and depend on the intrinsics being right for the session's orientation.
+
+## Repository layout
+
+| folder | what it is |
+|---|---|
+| `gait-analysis/` | the original torso pipeline (`pipelandmark.py`, `calculateangle.py`, `skeleton3d.py`) |
+| `motion-analysis/` | **one program for both subjects** &mdash; torso or hand, auto-detected. Shares one engine; the only differences live in `profiles.py`. |
+| `nolidar-gait-analysis/` | the same pipeline with the depth sensor removed, plus `compare.py` which scores it against the LiDAR version on physical invariants |
+| `tremor-analysis/` | spectral quantification of shaking. Parked &mdash; built ahead of need, and no recording containing real tremor exists yet. |
+| `general-lidar/` | standalone LiDAR utilities (depth maps, point clouds) |
+| `example/` | one face-blurred sample session |
+
+---
 
 ## General-LiDAR
 
