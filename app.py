@@ -6,6 +6,7 @@ Open: http://localhost:5000
 import collections
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import threading
 import time
 import uuid
 import zipfile
+from datetime import datetime
 
 from flask import Flask, jsonify, request, send_file
 
@@ -24,6 +26,16 @@ GAIT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gait-analys
 MOTION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'motion-analysis')
 PIPELINE_TIMEOUT = 3000  # seconds
 MOVIE_NAME = 'gait_skeleton_3d.mp4'
+
+# /home persists across restarts on Azure App Service; everything else is ephemeral.
+UPLOADS_DIR = '/home/uploads'
+OUTPUTS_DIR = '/home/outputs'
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+os.makedirs(OUTPUTS_DIR, exist_ok=True)
+
+# Set ADMIN_TOKEN as an Azure App Setting to enable the /admin/uploads page.
+# Leave unset to disable admin access entirely.
+ADMIN_TOKEN = os.environ.get('ADMIN_TOKEN', '')
 
 _jobs: dict = {}
 _lock = threading.Lock()
@@ -202,6 +214,36 @@ HTML = r"""<!doctype html>
     font-size: .85em; background: rgba(255,255,255,.06);
     padding: .1em .3em; border-radius: 3px;
   }
+
+  /* MDS-UPDRS test dropdown */
+  .test-select {
+    width: 100%; padding: .65rem .875rem; margin-bottom: .5rem;
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--border); border-radius: var(--r);
+    font-size: .875rem; cursor: pointer;
+    -webkit-appearance: none; -moz-appearance: none; appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%238b949e' d='M0 0l5 6 5-6z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right .875rem center;
+  }
+  .test-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(56,139,253,.15); }
+  .test-select option, .test-select optgroup { background: var(--surface); color: var(--text); }
+  .test-desc {
+    padding: .5rem .875rem .65rem; margin-bottom: 1.125rem;
+    border-radius: var(--r); border: 1px solid var(--border);
+    background: rgba(255,255,255,.02);
+    font-size: .78rem; color: var(--muted); line-height: 1.55;
+    display: none;
+  }
+  .test-desc.vis { display: block; }
+  .kind-badge {
+    display: inline-block; font-size: .7rem; font-weight: 600;
+    padding: .1rem .4rem; border-radius: 3px; margin-bottom: .35rem;
+    letter-spacing: .04em; text-transform: uppercase;
+  }
+  .badge-hand  { background: rgba(139,148,158,.15); color: var(--muted); }
+  .badge-torso { background: rgba(56,139,253,.15);  color: var(--accent); }
+  .badge-foot  { background: rgba(63,185,80,.15);   color: var(--success); }
+  .badge-spine { background: rgba(210,120,20,.15);  color: #d27814; }
 </style>
 </head>
 <body>
@@ -219,25 +261,38 @@ HTML = r"""<!doctype html>
     <input type="file" id="file" accept=".zip" style="display:none">
   </div>
 
-  <!-- Subject: torso or hand -->
-  <div class="opt-label">Subject</div>
-  <div class="tracker-row" id="subject-row">
-    <label class="t-opt selected">
-      <input type="radio" name="subject" value="auto" checked>
-      <div class="t-name">Auto-detect</div>
-      <div class="t-desc">Decides from the recording</div>
-    </label>
-    <label class="t-opt">
-      <input type="radio" name="subject" value="torso">
-      <div class="t-name">Torso</div>
-      <div class="t-desc">Walking · 12 joints</div>
-    </label>
-    <label class="t-opt">
-      <input type="radio" name="subject" value="hand">
-      <div class="t-name">Hand</div>
-      <div class="t-desc">Close-up · 21 joints</div>
-    </label>
-  </div>
+  <!-- MDS-UPDRS Part 3 test selector -->
+  <div class="opt-label">MDS-UPDRS Part 3 Test</div>
+  <select class="test-select" id="test-select">
+    <option value="" disabled selected>— Select a test —</option>
+    <optgroup label="Upper Extremity – Hand Close-Up">
+      <option value="3.4a"  data-kind="hand">3.4a · Finger Tapping – Right Hand</option>
+      <option value="3.4b"  data-kind="hand">3.4b · Finger Tapping – Left Hand</option>
+      <option value="3.5a"  data-kind="hand">3.5a · Hand Movements – Right Hand</option>
+      <option value="3.5b"  data-kind="hand">3.5b · Hand Movements – Left Hand</option>
+      <option value="3.6a"  data-kind="hand">3.6a · Pronation-Supination – Right Hand</option>
+      <option value="3.6b"  data-kind="hand">3.6b · Pronation-Supination – Left Hand</option>
+      <option value="3.15a" data-kind="hand">3.15a · Postural Tremor – Right Hand</option>
+      <option value="3.15b" data-kind="hand">3.15b · Postural Tremor – Left Hand</option>
+      <option value="3.16a" data-kind="hand">3.16a · Kinetic Tremor – Right Hand</option>
+      <option value="3.16b" data-kind="hand">3.16b · Kinetic Tremor – Left Hand</option>
+    </optgroup>
+    <optgroup label="Lower Extremity – Full Body">
+      <option value="3.7a"  data-kind="foot">3.7a · Toe Tapping – Right Foot</option>
+      <option value="3.7b"  data-kind="foot">3.7b · Toe Tapping – Left Foot</option>
+      <option value="3.8a"  data-kind="foot">3.8a · Leg Agility – Right Leg</option>
+      <option value="3.8b"  data-kind="foot">3.8b · Leg Agility – Left Leg</option>
+    </optgroup>
+    <optgroup label="Whole Body – Full Body">
+      <option value="3.9"   data-kind="torso">3.9 · Arising from Chair</option>
+      <option value="3.10"  data-kind="torso">3.10 · Gait</option>
+      <option value="3.11"  data-kind="torso">3.11 · Freezing of Gait</option>
+      <option value="3.12"  data-kind="torso">3.12 · Postural Stability</option>
+      <option value="3.13"  data-kind="spine">3.13 · Posture</option>
+      <option value="3.17"  data-kind="rest_tremor">3.17 · Rest Tremor – All Limbs</option>
+    </optgroup>
+  </select>
+  <div class="test-desc" id="test-desc"></div>
 
   <!-- Tracker choice (torso only) -->
   <div class="opt-label" id="tracker-label">Tracker</div>
@@ -254,7 +309,7 @@ HTML = r"""<!doctype html>
     </label>
   </div>
 
-  <button class="btn-primary" id="go" disabled>Analyze Gait</button>
+  <button class="btn-primary" id="go" disabled>Analyze</button>
 
   <div class="status" id="st">
     <span class="spin" id="spin"></span><span id="stmsg"></span>
@@ -277,11 +332,18 @@ HTML = r"""<!doctype html>
     <em>Compress</em> to create a ZIP. The folder must contain
     <code>rgb.mp4</code>, <code>camera_matrix.csv</code>,
     and the <code>depth/</code> &amp; <code>confidence/</code> frame folders.<br><br>
-    <b>Output:</b> One CSV per joint (ankle, knee, hip, shoulder, elbow, wrist — left &amp; right)
-    with X&nbsp;Y&nbsp;Z coordinates per frame, angle CSVs for knees, hips and elbows,
-    and a <b>3D stick figure movie</b> animating the joints with bones drawn between
-    them — shown as a three-quarter view alongside a side view rotated 90&deg;.
-    All axes are distances from the camera, so the figure moves through space.<br><br>
+    <b>Select the MDS-UPDRS Part 3 test</b> that matches your recording.
+    <em>Upper extremity</em> tests (finger tapping, hand movements, pronation-supination,
+    postural/kinetic tremor) use a hand close-up and track 21 finger joints.
+    <em>Lower extremity and whole-body</em> tests (gait, arising from chair, toe tapping, leg
+    agility, postural stability, posture) use a full-body view and track 12 joints
+    (shoulders through ankles).
+    <em>Rest tremor (3.17)</em> uses the same full-body view — one recording covers all four
+    limbs simultaneously; score each limb from its wrist or ankle CSV.<br><br>
+    <b>Output:</b> One CSV per joint with X&nbsp;Y&nbsp;Z coordinates per frame,
+    angle CSVs for each measured joint pair, and a <b>3D stick figure movie</b>
+    animating the joints with bones drawn between them — three-quarter and side views.
+    All axes are real-world distances from the camera.<br><br>
     <b>Note:</b> Processing takes 5&nbsp;–&nbsp;15&nbsp;minutes depending on video length.
     Keep this tab open while it runs.
   </div>
@@ -320,35 +382,86 @@ function pick(f) {
   chosen = f;
   fname.textContent = f.name + '  (' + (f.size / 1048576).toFixed(1) + ' MB)';
   drop.classList.add('has-file');
-  go.disabled = false;
+  syncTracker();
   reset();
 }
 
 document.querySelectorAll('.t-opt').forEach(o => o.addEventListener('click', () => {
-  // selection is per row, so the subject and tracker groups stay independent
   const row = o.closest('.tracker-row');
   row.querySelectorAll('.t-opt').forEach(x => x.classList.remove('selected'));
   o.classList.add('selected');
-  syncTracker();
 }));
 
-// RTMPose only exists for the torso pipeline, so hide the choice for a hand.
+const testSelect = document.getElementById('test-select');
+const testDesc   = document.getElementById('test-desc');
+
+const TEST_META = {
+  '3.4a':  {kind:'hand',  desc:'Tap index finger to thumb as fast as possible for ~10 sec. Records speed, amplitude, and rhythm decay of each tap.'},
+  '3.4b':  {kind:'hand',  desc:'Tap index finger to thumb as fast as possible for ~10 sec. Records speed, amplitude, and rhythm decay of each tap.'},
+  '3.5a':  {kind:'hand',  desc:'Open and close the fist fully as fast as possible for ~10 sec. Records amplitude and speed of hand opening.'},
+  '3.5b':  {kind:'hand',  desc:'Open and close the fist fully as fast as possible for ~10 sec. Records amplitude and speed of hand opening.'},
+  '3.6a':  {kind:'hand',  desc:'Rapidly alternate palm-up and palm-down for ~10 sec. Records rotational speed and regularity.'},
+  '3.6b':  {kind:'hand',  desc:'Rapidly alternate palm-up and palm-down for ~10 sec. Records rotational speed and regularity.'},
+  '3.7a':  {kind:'foot',  desc:'While seated, tap the right toe up and down repeatedly for ~10 sec. Records cadence, lift amplitude (ankle dorsiflexion), and hesitations.'},
+  '3.7b':  {kind:'foot',  desc:'While seated, tap the left toe up and down repeatedly for ~10 sec. Records cadence, lift amplitude (ankle dorsiflexion), and hesitations.'},
+  '3.8a':  {kind:'foot',  desc:'While seated, stamp the right foot rapidly for ~10 sec. Records lift height, speed, and regularity. Tracks heel and toe separately.'},
+  '3.8b':  {kind:'foot',  desc:'While seated, stamp the left foot rapidly for ~10 sec. Records lift height, speed, and regularity. Tracks heel and toe separately.'},
+  '3.9':   {kind:'torso', desc:'Rise from an armless chair with arms crossed over the chest. Records trunk lean, rise speed, and balance on completion.'},
+  '3.10':  {kind:'torso', desc:'Walk ~10 m, turn, and return. Records step length, cadence, arm swing, and trunk posture throughout.'},
+  '3.11':  {kind:'torso', desc:'Walk through a doorway and turn twice. Detects hesitation, shuffling, and freezing episodes.'},
+  '3.12':  {kind:'torso', desc:'Stand and recover from an unexpected backward pull on the shoulders. Records trunk displacement and recovery time.'},
+  '3.13':  {kind:'spine', desc:'Stand naturally with eyes open. Records vertebral-level angles (lumbar through cervical) using the SpinePose 37-keypoint model to quantify stooped posture.'},
+  '3.15a': {kind:'hand',  desc:'Hold the right arm outstretched and still for ~10 sec. Records involuntary oscillation amplitude and frequency.'},
+  '3.15b': {kind:'hand',  desc:'Hold the left arm outstretched and still for ~10 sec. Records involuntary oscillation amplitude and frequency.'},
+  '3.16a': {kind:'hand',  desc:'Move the right index finger repeatedly from your nose to a fixed target. Records tremor amplitude during intentional movement.'},
+  '3.16b': {kind:'hand',  desc:'Move the left index finger repeatedly from your nose to a fixed target. Records tremor amplitude during intentional movement.'},
+  '3.17':  {kind:'rest_tremor', desc:'Sit quietly with hands placed on the chair arms and feet flat on the floor for 10 sec. Records wrist and ankle positions from all four limbs simultaneously — use the output CSVs to score RUE, LUE, RLE, and LLE rest tremor separately.'},
+};
+
+testSelect.addEventListener('change', syncTracker);
+
+// RTMPose only exists for the torso pipeline, so grey it out for hand tests.
 function syncTracker() {
-  const subj = document.querySelector('input[name="subject"]:checked').value;
-  const row = document.getElementById('tracker-row');
-  const lbl = document.getElementById('tracker-label');
-  const off = (subj === 'hand');
-  row.classList.toggle('disabled', off);
-  lbl.textContent = off ? 'Tracker (torso only)' : 'Tracker';
-  document.getElementById('go').textContent =
-    subj === 'hand' ? 'Analyze Hand' : (subj === 'torso' ? 'Analyze Gait' : 'Analyze');
+  const val  = testSelect.value;
+  const meta = TEST_META[val];
+  const opt  = testSelect.options[testSelect.selectedIndex];
+  const kind = (opt && opt.dataset) ? opt.dataset.kind : '';
+
+  if (meta) {
+    const badge = kind === 'hand'
+      ? '<span class="kind-badge badge-hand">Hand close-up · 21 joints</span>'
+      : kind === 'foot'
+      ? '<span class="kind-badge badge-foot">Full body · 18 joints (feet)</span>'
+      : kind === 'spine'
+      ? '<span class="kind-badge badge-spine">Spine · 6 vertebral angles</span>'
+      : kind === 'rest_tremor'
+      ? '<span class="kind-badge badge-torso">Full body · 12 joints · 3-frame smoothing</span>'
+      : '<span class="kind-badge badge-torso">Full body · 12 joints</span>';
+    testDesc.innerHTML = badge + '<br>' + meta.desc;
+    testDesc.className = 'test-desc vis';
+  } else {
+    testDesc.className = 'test-desc';
+  }
+
+  const trackerRow = document.getElementById('tracker-row');
+  const trackerLbl = document.getElementById('tracker-label');
+  const off = (kind === 'hand' || kind === 'foot' || kind === 'spine' || kind === 'rest_tremor');
+  trackerRow.classList.toggle('disabled', off);
+  trackerLbl.textContent = kind === 'hand'        ? 'Tracker (torso only)'
+                         : kind === 'foot'        ? 'Tracker (WholeBody, fixed)'
+                         : kind === 'spine'       ? 'Tracker (SpinePose, fixed)'
+                         : kind === 'rest_tremor' ? 'Tracker (MediaPipe, fixed)'
+                         : 'Tracker';
+
+  go.disabled = !(chosen && val);
 }
 syncTracker();
 
 go.addEventListener('click', async () => {
-  if (!chosen) return;
-  const tracker = document.querySelector('input[name="tracker"]:checked').value;
-  const subject = document.querySelector('input[name="subject"]:checked').value;
+  if (!chosen || !testSelect.value) return;
+  const tracker  = document.querySelector('input[name="tracker"]:checked').value;
+  const test     = testSelect.value;
+  const testName = testSelect.options[testSelect.selectedIndex].text.split('·').slice(1).join('·').trim();
   go.disabled = true;
   setStatus('proc', 'Uploading…');
   dl.className = 'dl-btn';
@@ -356,7 +469,7 @@ go.addEventListener('click', async () => {
   const form = new FormData();
   form.append('session', chosen);
   form.append('tracker', tracker);
-  form.append('subject', subject);
+  form.append('test', test);
 
   let jobId;
   try {
@@ -366,7 +479,7 @@ go.addEventListener('click', async () => {
     jobId = d.job_id;
   } catch (e) { return fail(e.message); }
 
-  setStatus('proc', 'Analyzing gait…');
+  setStatus('proc', 'Analyzing ' + testName + '…');
   pwrap.className = 'pwrap vis';
   setProgress(0, 'Starting…');
   const started = Date.now();
@@ -484,6 +597,35 @@ def healthz():
         '    import mediapipe as mp; out["mp.solutions"] = {"ok": hasattr(mp, "solutions")}\n'
         'except Exception as e:\n'
         '    out["mp.solutions"] = {"ok": False, "error": str(e)}\n'
+        f'sys.path.insert(0, {repr(MOTION_DIR)})\n'
+        'try:\n'
+        '    import extract; out["motion.extract"] = {"ok": True}\n'
+        'except Exception as e:\n'
+        '    out["motion.extract"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
+        'try:\n'
+        '    from rtmlib import Wholebody; out["rtmlib.Wholebody"] = {"ok": True}\n'
+        'except Exception as e:\n'
+        '    out["rtmlib.Wholebody"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
+        'try:\n'
+        '    import profiles; p = profiles.get("foot"); out["profiles.foot"] = {"ok": True, "model": p["model"]}\n'
+        'except Exception as e:\n'
+        '    out["profiles.foot"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
+        'try:\n'
+        '    import profiles; p = profiles.get("toe_tap"); out["profiles.toe_tap"] = {"ok": True, "model": p["model"], "pixel_win": p.get("pixel_smooth_window")}\n'
+        'except Exception as e:\n'
+        '    out["profiles.toe_tap"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
+        'try:\n'
+        '    import profiles; p = profiles.get("rest_tremor"); out["profiles.rest_tremor"] = {"ok": True, "model": p["model"], "pixel_win": p.get("pixel_smooth_window")}\n'
+        'except Exception as e:\n'
+        '    out["profiles.rest_tremor"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
+        'try:\n'
+        '    from spinepose import PoseTracker as SpinePT, SpinePoseEstimator; out["spinepose"] = {"ok": True}\n'
+        'except Exception as e:\n'
+        '    out["spinepose"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
+        'try:\n'
+        '    import profiles; p = profiles.get("spine"); out["profiles.spine"] = {"ok": True, "model": p["model"]}\n'
+        'except Exception as e:\n'
+        '    out["profiles.spine"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
         'print(json.dumps(out))\n'
     )
     proc = subprocess.run(
@@ -504,14 +646,43 @@ def upload():
     if tracker not in ('mediapipe', 'rtmpose'):
         tracker = 'mediapipe'
 
-    # 'auto' lets motion-analysis decide from the recording; lower-body
-    # visibility separates a walking subject from a hand close-up cleanly.
-    subject = request.form.get('subject', 'auto')
-    if subject not in ('auto', 'torso', 'hand'):
-        subject = 'auto'
+    # Map the MDS-UPDRS test ID to the pipeline kind (torso/hand).
+    # The old 'subject' field is kept as a fallback for direct API callers.
+    _test_to_kind = {
+        '3.4a': 'hand',  '3.4b': 'hand',
+        '3.5a': 'hand',  '3.5b': 'hand',
+        '3.6a': 'hand',  '3.6b': 'hand',
+        # 3.7 (Toe Tapping): lower-leg-only profile, 13-frame pixel smoothing.
+        # 3.8 (Leg Agility): full-body foot profile for wider context.
+        '3.7a': 'toe_tap', '3.7b': 'toe_tap',
+        '3.8a': 'foot',    '3.8b': 'foot',
+        '3.9':  'torso', '3.10': 'torso', '3.11': 'torso',
+        '3.12': 'torso', '3.13': 'spine',
+        '3.15a': 'hand', '3.15b': 'hand',
+        '3.16a': 'hand', '3.16b': 'hand',
+        # 3.17 (Rest Tremor): all four limbs in one recording, 3-frame pixel smoothing.
+        '3.17': 'rest_tremor',
+    }
+    test_id = request.form.get('test', '')
+    if test_id in _test_to_kind:
+        subject = _test_to_kind[test_id]
+    else:
+        subject = request.form.get('subject', 'auto')
+        if subject not in ('auto', 'torso', 'hand'):
+            subject = 'auto'
 
     job_id = str(uuid.uuid4())
     zip_bytes = f.read()
+
+    # Persist the raw upload so it can be retrieved later via /admin/uploads.
+    safe_name = re.sub(r'[^\w\-.]', '_', f.filename or 'upload')[:80]
+    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    save_path = os.path.join(UPLOADS_DIR, f"{ts}_{job_id[:8]}_{safe_name}")
+    try:
+        with open(save_path, 'wb') as fh:
+            fh.write(zip_bytes)
+    except OSError:
+        pass  # non-fatal; processing continues even if the save fails
 
     with _lock:
         _jobs[job_id] = {'status': 'processing', 'result': None, 'error': None,
@@ -566,6 +737,124 @@ def movie(job_id):
         as_attachment=request.args.get('download') == '1',
         conditional=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Admin — upload retrieval
+# ---------------------------------------------------------------------------
+
+def _check_admin(req):
+    """Return None if the request is authorised, or a (message, status) tuple."""
+    if not ADMIN_TOKEN:
+        return ('ADMIN_TOKEN app setting is not configured on this server.', 403)
+    if req.args.get('token') != ADMIN_TOKEN:
+        return ('Invalid or missing token. Append ?token=<ADMIN_TOKEN> to the URL.', 401)
+    return None
+
+
+@app.route('/admin/uploads')
+def admin_uploads():
+    err = _check_admin(request)
+    if err:
+        return err
+
+    entries = []
+    for name in os.listdir(UPLOADS_DIR):
+        path = os.path.join(UPLOADS_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        size_kb = os.path.getsize(path) // 1024
+        mtime = datetime.utcfromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M UTC')
+        entries.append((name, size_kb, mtime))
+    entries.sort(key=lambda e: e[2], reverse=True)
+
+    token = request.args['token']
+    rows = ''.join(
+        f'<tr><td style="padding:4px 12px">{name}</td>'
+        f'<td style="padding:4px 12px">{size_kb} KB</td>'
+        f'<td style="padding:4px 12px">{mtime}</td>'
+        f'<td style="padding:4px 12px"><a href="/admin/download/{name}?token={token}">download</a></td></tr>'
+        for name, size_kb, mtime in entries
+    )
+    html = (
+        '<html><body style="font-family:monospace">'
+        f'<h3>Saved uploads ({len(entries)} files)</h3>'
+        '<table border="1" cellspacing="0"><tr>'
+        '<th style="padding:4px 12px">File</th>'
+        '<th style="padding:4px 12px">Size</th>'
+        '<th style="padding:4px 12px">Uploaded</th>'
+        '<th></th></tr>'
+        + rows +
+        '</table></body></html>'
+    )
+    return html
+
+
+@app.route('/admin/outputs')
+def admin_outputs():
+    err = _check_admin(request)
+    if err:
+        return err
+
+    entries = []
+    for name in os.listdir(OUTPUTS_DIR):
+        path = os.path.join(OUTPUTS_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        size_kb = os.path.getsize(path) // 1024
+        mtime = datetime.utcfromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M UTC')
+        entries.append((name, size_kb, mtime))
+    entries.sort(key=lambda e: e[2], reverse=True)
+
+    token = request.args['token']
+    rows = ''.join(
+        f'<tr><td style="padding:4px 12px">{name}</td>'
+        f'<td style="padding:4px 12px">{size_kb} KB</td>'
+        f'<td style="padding:4px 12px">{mtime}</td>'
+        f'<td style="padding:4px 12px"><a href="/admin/download-output/{name}?token={token}">download</a></td></tr>'
+        for name, size_kb, mtime in entries
+    )
+    html = (
+        '<html><body style="font-family:monospace">'
+        f'<h3>Saved outputs ({len(entries)} files)</h3>'
+        '<table border="1" cellspacing="0"><tr>'
+        '<th style="padding:4px 12px">File</th>'
+        '<th style="padding:4px 12px">Size</th>'
+        '<th style="padding:4px 12px">Time</th>'
+        '<th></th></tr>'
+        + rows +
+        '</table></body></html>'
+    )
+    return html
+
+
+@app.route('/admin/download-output/<path:filename>')
+def admin_download_output(filename):
+    err = _check_admin(request)
+    if err:
+        return err
+
+    if '/' in filename or '\\' in filename or '..' in filename:
+        return ('Bad filename.', 400)
+    path = os.path.join(OUTPUTS_DIR, filename)
+    if not os.path.isfile(path):
+        return ('File not found.', 404)
+    return send_file(path, as_attachment=True, download_name=filename)
+
+
+@app.route('/admin/download/<path:filename>')
+def admin_download(filename):
+    err = _check_admin(request)
+    if err:
+        return err
+
+    # Guard against path traversal
+    if '/' in filename or '\\' in filename or '..' in filename:
+        return ('Bad filename.', 400)
+    path = os.path.join(UPLOADS_DIR, filename)
+    if not os.path.isfile(path):
+        return ('File not found.', 404)
+    return send_file(path, as_attachment=True, download_name=filename)
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +917,7 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
         data_rel = os.path.join('charts', session, 'data')
         cam_rel = os.path.join(session, 'camera_matrix.csv')
 
-        if kind == 'hand':
+        if kind in ('hand', 'foot', 'toe_tap', 'rest_tremor', 'spine'):
             # motion-analysis writes data/ under the folder it is given, so
             # pointing it at charts/<session> puts the CSVs exactly where the
             # bundling step below already looks for them.
@@ -638,8 +927,8 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
                 'import matplotlib; matplotlib.use("Agg")',
                 f'sys.path.insert(0, {repr(MOTION_DIR)})',
                 'import extract, angles, profiles, skeleton3d',
-                '_p = profiles.get("hand")',
-                f'_a, _geom = extract.extract_all_landmarks({repr(session)}, kind="hand")',
+                f'_p = profiles.get({repr(kind)})',
+                f'_a, _geom = extract.extract_all_landmarks({repr(session)}, kind={repr(kind)})',
                 '_ang = angles.compute(_a, _p)',
                 f'angles.write(_a, _ang, _p, {repr(out_rel)}, fps=60.0, graphs=True)',
                 f'skeleton3d.render(_a, _p, {repr(MOVIE_NAME)}, fps=60.0)',
@@ -673,8 +962,10 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
             script = '; '.join(script_lines)
 
         # Fail with something actionable rather than an ImportError traceback.
-        # RTMPose is a torso-only tracker, so a hand job never needs the probe.
-        if tracker == 'rtmpose' and kind != 'hand':
+        # The tracker dropdown applies only to the gait-analysis torso pipeline;
+        # hand and foot use their own fixed models (MediaPipe Hands and rtmlib
+        # Wholebody respectively), so only check rtmlib when torso+rtmpose.
+        if tracker == 'rtmpose' and kind == 'torso':
             probe = subprocess.run([sys.executable, '-c', 'import rtmlib'],
                                    capture_output=True, text=True)
             if probe.returncode != 0:
@@ -697,7 +988,7 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
 
         tail = collections.deque(maxlen=100)
         deadline = time.monotonic() + PIPELINE_TIMEOUT
-        n_joints, cur_joint = (15 if kind == 'hand' else 6), 0
+        n_joints, cur_joint = (15 if kind == 'hand' else 8 if kind == 'foot' else 6), 0
         # Three phases share the bar: the single tracking pass over the video,
         # the quick per-joint angle maths, then rendering the 3D movie. A fully
         # cached session emits no @@FRAME, so the joints carry the first stretch.
@@ -776,9 +1067,22 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
             if movie is not None:
                 zf.writestr(MOVIE_NAME, movie, compress_type=zipfile.ZIP_STORED)
         buf.seek(0)
+        result_bytes = buf.read()
+
+        # Persist output to /home/outputs so it can be retrieved later.
+        ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        out_stem = f"{ts}_{job_id[:8]}"
+        try:
+            with open(os.path.join(OUTPUTS_DIR, f"{out_stem}_output.zip"), 'wb') as fh:
+                fh.write(result_bytes)
+            if movie is not None:
+                with open(os.path.join(OUTPUTS_DIR, f"{out_stem}_skeleton.mp4"), 'wb') as fh:
+                    fh.write(movie)
+        except OSError:
+            pass
 
         with _lock:
-            _jobs[job_id] = {'status': 'done', 'result': buf.read(), 'error': None,
+            _jobs[job_id] = {'status': 'done', 'result': result_bytes, 'error': None,
                              'percent': 100, 'stage': 'Complete',
                              'movie': movie}
 

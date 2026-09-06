@@ -42,7 +42,53 @@ def _frame_pngs(d):
                   if f.lower().endswith('.png') and not f.startswith('.'))
 
 
+class _SpinePoseCtx:
+    """Wraps spinepose.PoseTracker as a context manager."""
+    def __init__(self, **kwargs):
+        self._kwargs = kwargs
+        self._tracker = None
+
+    def __enter__(self):
+        from spinepose import PoseTracker as SpinePT, SpinePoseEstimator
+        self._tracker = SpinePT(SpinePoseEstimator, **self._kwargs)
+        return self
+
+    def __exit__(self, *_):
+        self._tracker = None
+
+    def process(self, frame_rgb):
+        bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        return self._tracker(bgr)  # (keypoints, scores)
+
+
+class _RtmLibCtx:
+    """Wraps a rtmlib PoseTracker as a context manager matching MediaPipe's API."""
+    def __init__(self, preset, **kwargs):
+        self._preset = preset
+        self._kwargs = kwargs
+        self._tracker = None
+
+    def __enter__(self):
+        from rtmlib import PoseTracker
+        self._tracker = PoseTracker(self._preset, **self._kwargs)
+        return self
+
+    def __exit__(self, *_):
+        self._tracker = None
+
+    def process(self, frame_rgb):
+        bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        return self._tracker(bgr)  # returns (keypoints, scores)
+
+
 def _open_model(profile, max_hands):
+    if profile["model"] == "spine":
+        return _SpinePoseCtx(mode='large', det_frequency=10, tracking=False)
+    if profile["model"] == "wholebody":
+        from rtmlib import Wholebody
+        return _RtmLibCtx(Wholebody, mode='balanced', backend='onnxruntime',
+                          device='cpu', det_frequency=10, tracking=False,
+                          to_openpose=False)
     if profile["model"] == "hands":
         return mp.solutions.hands.Hands(
             static_image_mode=False, max_num_hands=max_hands,
@@ -53,15 +99,24 @@ def _open_model(profile, max_hands):
         min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
 
-def _landmarks_of(profile, results):
-    """The per-frame landmark list, or None when nothing was detected."""
+def _landmarks_of(profile, results, width, height):
+    """Per-frame landmarks as list[(abs_x, abs_y)] indexed by landmark idx, or None."""
+    if profile["model"] in ("wholebody", "spine"):
+        kps, scores = results
+        if kps is None or len(kps) == 0:
+            return None
+        best = int(np.argmax(np.asarray(scores).mean(axis=1)))
+        kp = np.asarray(kps)[best]  # (N, 2) — absolute pixel coords
+        return [(int(kp[i][0]), int(kp[i][1])) for i in range(len(kp))]
+    # mediapipe path — normalize to the same (abs_x, abs_y) format
     if profile["model"] == "hands":
-        if results.multi_hand_landmarks:
-            return results.multi_hand_landmarks[0].landmark
+        raw = (results.multi_hand_landmarks[0].landmark
+               if results.multi_hand_landmarks else None)
+    else:
+        raw = results.pose_landmarks.landmark if results.pose_landmarks else None
+    if raw is None:
         return None
-    if results.pose_landmarks:
-        return results.pose_landmarks.landmark
-    return None
+    return [(int(lm.x * width), int(lm.y * height)) for lm in raw]
 
 
 def extract_all_landmarks(folder, kind=profiles.TORSO, max_hands=1):
@@ -101,8 +156,8 @@ def extract_all_landmarks(folder, kind=profiles.TORSO, max_hands=1):
     prev = {name: None for name in landmark_map}
 
     use_bg = profile.get("background_rejection", True)
-    bg_model = (background.build_model(depth_folder, depth_files, rotate)
-                if use_bg else None)
+    bg_model, static_mask = (background.build_model(depth_folder, depth_files, rotate)
+                             if use_bg else (None, None))
     drift = background.camera_drift(folder)
     if not use_bg:
         print("Background rejection disabled for this subject kind "
@@ -111,13 +166,18 @@ def extract_all_landmarks(folder, kind=profiles.TORSO, max_hands=1):
         print("No background model (too few depth frames); "
               "background rejection disabled")
     else:
+        n_static = int(static_mask.sum()) if static_mask is not None else 0
+        total_px = bg_model.size
         print(f"Background model built from "
               f"{min(len(depth_files), background.MAX_MODEL_FRAMES)} frames"
-              + (f"; camera drift {drift*100:.1f} cm" if drift is not None else ""))
+              + (f"; camera drift {drift*100:.1f} cm" if drift is not None else "")
+              + f"; {n_static}/{total_px} pixels ({100.0*n_static/total_px:.1f}%)"
+                f" identified as static walls")
         if drift is not None and drift > background.DRIFT_WARN_M:
             print(f"Warning: camera moved {drift*100:.0f} cm during the "
                   f"recording, so the background model may be unreliable.")
     n_bg_rejected = {name: 0 for name in landmark_map}
+    n_static_rejected = {name: 0 for name in landmark_map}
     n_undetected = 0
 
     cap = cv2.VideoCapture(video_path)
@@ -158,14 +218,14 @@ def extract_all_landmarks(folder, kind=profiles.TORSO, max_hands=1):
                     conf = cv2.rotate(conf, cv2.ROTATE_90_CLOCKWISE)
             depth_meters = depth_mm / 1000.0
 
-            lms = _landmarks_of(profile, results)
+            # _landmarks_of returns list[(abs_x, abs_y)] or None for all backends
+            lms = _landmarks_of(profile, results, width, height)
             if lms is None:
                 n_undetected += 1
 
             for name, idx in landmark_map.items():
                 if lms is not None:
-                    lm = lms[idx]
-                    pos = (int(lm.x * width), int(lm.y * height))
+                    pos = lms[idx]
                     prev[name] = pos
                 else:
                     pos = prev[name]
@@ -178,7 +238,26 @@ def extract_all_landmarks(folder, kind=profiles.TORSO, max_hands=1):
 
                 pointx = int(np.clip(pos[0], 0, width - 1))
                 pointy = int(np.clip(pos[1], 0, height - 1))
-                z = float(depth_meters[pointy, pointx])
+
+                # Sample a 5×5 neighbourhood and take the minimum valid depth.
+                # Minimum (not median) is intentional: background is always
+                # farther than the body, so min() reliably picks the body pixel
+                # even when edge pixels or sparse background reads outnumber
+                # body pixels in the patch.  The confidence gate below filters
+                # zero-confidence pixels before the min is taken.
+                _r = 2  # half-side of the square patch (inclusive)
+                ys = slice(max(0, pointy - _r), min(height, pointy + _r + 1))
+                xs = slice(max(0, pointx - _r), min(width,  pointx + _r + 1))
+                patch_d = depth_meters[ys, xs]
+                patch_c = conf[ys, xs] if conf is not None else None
+                valid_mask = patch_d > 0
+                if patch_c is not None:
+                    valid_mask &= patch_c > 0
+                if valid_mask.any():
+                    z = float(patch_d[valid_mask].min())
+                else:
+                    z = float(depth_meters[pointy, pointx])
+
                 # An unusable reading is excluded from the average rather than
                 # replaced by the previous frame, so it cannot drag its
                 # neighbours; smoothing fills the gap from both sides.
@@ -187,6 +266,11 @@ def extract_all_landmarks(folder, kind=profiles.TORSO, max_hands=1):
                 # behind it instead of the joint.
                 if usable and background.is_background(bg_model, z, pointx, pointy):
                     n_bg_rejected[name] += 1
+                    usable = False
+                # A pixel whose depth never changes throughout the recording is part
+                # of the static scene (wall, floor area never stepped on, furniture).
+                if usable and background.is_static_pixel(static_mask, pointx, pointy):
+                    n_static_rejected[name] += 1
                     usable = False
                 pix[name].append((pointx, pointy))
                 raw_z[name].append(z)
@@ -218,6 +302,13 @@ def extract_all_landmarks(folder, kind=profiles.TORSO, max_hands=1):
               f"({100.0*total_rejected/max(n_samples,1):.1f}% of samples; "
               f"most affected: {worst[0]}, {worst[1]})")
 
+    total_static = sum(n_static_rejected.values())
+    if total_static:
+        worst_s = max(n_static_rejected.items(), key=lambda kv: kv[1])
+        print(f"Rejected {total_static} readings on static-wall pixels "
+              f"({100.0*total_static/max(n_samples,1):.1f}% of samples; "
+              f"most affected: {worst_s[0]}, {worst_s[1]})")
+
     # Anatomical plausibility: the subject has a bounded depth extent, so a
     # reading far outside it is the scene behind the joint rather than the joint.
     # Done before smoothing so a bad sample never enters the average.
@@ -239,18 +330,33 @@ def extract_all_landmarks(folder, kind=profiles.TORSO, max_hands=1):
                   f"{max_extent*100:.0f} cm in depth from the rest of the "
                   f"subject ({100.0*n_implausible/max(n_samples,1):.1f}% of samples)")
 
-    print(f"Smoothing depth over {depthsmooth.DEFAULT_WINDOW} frames")
+    depth_win = depthsmooth.DEFAULT_WINDOW
+    pixel_win = profile.get("pixel_smooth_window", depth_win)
+    print(f"Smoothing depth over {depth_win} frames, pixels over {pixel_win} frames")
+
     arrays = {}
     for name in landmark_map:
-        z = depthsmooth.smooth_series(raw_z[name], ok_z[name],
-                                      depthsmooth.DEFAULT_WINDOW)
+        z = depthsmooth.smooth_series(raw_z[name], ok_z[name], depth_win)
+
+        # Smooth the 2D landmark pixel positions to remove RTMPose per-frame
+        # jitter.  At 1 m the LiDAR pixel pitch is ~7 mm, so 2-3 px of model
+        # noise = 14-21 mm — the dominant source of jitter for small movements
+        # like toe tapping.  smooth_series is centred so there is no temporal
+        # lag on the motion signal.
+        raw_cols = np.array([float(p[0]) for p in pix[name]])
+        raw_rows = np.array([float(p[1]) for p in pix[name]])
+        ok_pix   = np.array([p != (0, 0)  for p in pix[name]])
+        s_cols = depthsmooth.smooth_series(raw_cols, ok_pix, pixel_win)
+        s_rows = depthsmooth.smooth_series(raw_rows, ok_pix, pixel_win)
+
         pts = []
-        for (pointx, pointy), zi in zip(pix[name], z):
+        for i, ((pointx, pointy), zi) in enumerate(zip(pix[name], z)):
             if zi is None or not np.isfinite(zi) or zi <= 0:
                 pts.append((0, 0, 0))
                 continue
-            pts.append(((pointx - cx) * zi / fx,
-                        (pointy - cy) * zi / fy,
+            sc, sr = s_cols[i], s_rows[i]
+            pts.append(((sc - cx) * zi / fx,
+                        (sr - cy) * zi / fy,
                         zi))
         arrays[name] = pts
     return arrays, geom

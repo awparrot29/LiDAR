@@ -44,6 +44,13 @@ MAX_MODEL_FRAMES = 200
 # be trusted.
 DRIFT_WARN_M = 0.15
 
+# Pixels whose depth standard deviation over the sampled frames is below this
+# threshold are classified as static scene (wall, floor, furniture that was
+# never occluded). LiDAR noise on a truly static surface is roughly 5-10 mm, so
+# 20 mm leaves a comfortable margin while remaining far below the hundreds of mm
+# of variance a moving limb introduces.
+STATIC_STD_M = 0.020
+
 
 def camera_drift(folder):
     """Largest distance the camera moved from its starting pose, in metres.
@@ -67,9 +74,19 @@ def camera_drift(folder):
 
 
 def build_model(depth_folder, depth_files, rotate, max_frames=MAX_MODEL_FRAMES):
-    """Per-pixel background depth in metres, or None if it cannot be built."""
+    """Per-pixel background model built from sampled depth frames.
+
+    Returns (percentile_map, static_mask), or (None, None) if there are too few frames.
+
+    percentile_map : float32 array (H, W), 90th-percentile depth in metres per
+                     pixel.  np.inf where a pixel never returned a valid reading.
+    static_mask    : bool array (H, W), True where depth std dev across the
+                     sampled frames is below STATIC_STD_M — these pixels are
+                     permanently part of the static scene and should not be
+                     trusted as joint readings.
+    """
     if len(depth_files) < 10:
-        return None
+        return None, None
 
     step = max(1, len(depth_files) // max_frames)
     chosen = depth_files[::step]
@@ -83,16 +100,20 @@ def build_model(depth_folder, depth_files, rotate, max_frames=MAX_MODEL_FRAMES):
             d = cv2.rotate(d, cv2.ROTATE_90_CLOCKWISE)
         frames.append(d)
     if len(frames) < 10:
-        return None
+        return None, None
 
     stack = np.stack(frames).astype(np.float32) / 1000.0
-    # Zeros are dropouts, not surfaces, so they must not drag the percentile down
+    # Zeros are dropouts, not surfaces, so they must not drag the statistics down
     stack[stack <= 0] = np.nan
     with np.errstate(invalid="ignore"):
         model = np.nanpercentile(stack, BACKGROUND_PCT, axis=0)
+        std = np.nanstd(stack, axis=0)
     # Pixels that never returned anything cannot reject anything
     model[~np.isfinite(model)] = np.inf
-    return model
+    # Pixels with near-zero depth variation over the whole recording are walls or
+    # other static scene elements the subject never moved in front of.
+    static_mask = np.isfinite(std) & (std < STATIC_STD_M)
+    return model, static_mask
 
 
 def is_background(model, depth, u, v, tolerance=BACKGROUND_TOLERANCE_M):
@@ -103,3 +124,10 @@ def is_background(model, depth, u, v, tolerance=BACKGROUND_TOLERANCE_M):
     if not np.isfinite(behind):
         return False
     return (behind - depth) < tolerance
+
+
+def is_static_pixel(static_mask, u, v):
+    """True when pixel (u, v) had near-constant depth throughout the recording."""
+    if static_mask is None:
+        return False
+    return bool(static_mask[v, u])

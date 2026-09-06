@@ -22,3 +22,7 @@ $PIP uninstall -y opencv-python opencv-contrib-python opencv-python-headless || 
 $PIP install --no-cache-dir opencv-contrib-python-headless || exit 1
 
 echo "postbuild: opencv swapped to headless build"
+
+# Remove Oryx's build tarball — it can be 2-3 GB and fills small /home disks.
+# Oryx uses .gz or .zst depending on version.
+rm -f /home/site/wwwroot/output.tar.gz /home/site/wwwroot/output.tar.zst && echo "postbuild: output tarball removed"
