@@ -5,6 +5,7 @@ Open: http://localhost:5000
 """
 import collections
 import io
+import json
 import os
 import re
 import shutil
@@ -26,6 +27,59 @@ GAIT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gait-analys
 MOTION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'motion-analysis')
 PIPELINE_TIMEOUT = 3000  # seconds
 MOVIE_NAME = 'gait_skeleton_3d.mp4'
+
+# Every .py that must reach the server for the motion-analysis pipelines to run.
+# A deploy that drops any of these still passes a naive import check, because
+# most are pulled in transitively — extract.py imports background/sessiongeom at
+# module load, and skeleton3d is only touched at the final render step. Keeping
+# the list here lets /healthz and the deploy guard check the same thing.
+MOTION_MODULES = ('angles', 'background', 'depthsmooth', 'detect', 'extract',
+                  'process_session', 'profiles', 'sessiongeom', 'skeleton3d')
+
+# Subject kinds profiles.get() must answer for.
+PROFILE_KINDS = ('torso', 'hand', 'foot', 'toe_tap', 'rest_tremor', 'spine')
+
+# MDS-UPDRS test ID -> pipeline kind. Module level so /upload and the admin
+# listing agree, and so a stored recording can be labelled with the test it was
+# actually recorded for.
+TEST_TO_KIND = {
+    '3.4a': 'hand',  '3.4b': 'hand',
+    '3.5a': 'hand',  '3.5b': 'hand',
+    '3.6a': 'hand',  '3.6b': 'hand',
+    # 3.7 (Toe Tapping): lower-leg-only profile, 13-frame pixel smoothing.
+    # 3.8 (Leg Agility): full-body foot profile for wider context.
+    '3.7a': 'toe_tap', '3.7b': 'toe_tap',
+    '3.8a': 'foot',    '3.8b': 'foot',
+    '3.9':  'torso', '3.10': 'torso', '3.11': 'torso',
+    '3.12': 'torso', '3.13': 'spine',
+    '3.15a': 'hand', '3.15b': 'hand',
+    '3.16a': 'hand', '3.16b': 'hand',
+    # 3.17 (Rest Tremor): all four limbs in one recording, 3-frame pixel smoothing.
+    '3.17': 'rest_tremor',
+}
+
+TEST_LABELS = {
+    '3.4a': 'Finger Tapping – Right Hand',
+    '3.4b': 'Finger Tapping – Left Hand',
+    '3.5a': 'Hand Movements – Right Hand',
+    '3.5b': 'Hand Movements – Left Hand',
+    '3.6a': 'Pronation-Supination – Right Hand',
+    '3.6b': 'Pronation-Supination – Left Hand',
+    '3.7a': 'Toe Tapping – Right Foot',
+    '3.7b': 'Toe Tapping – Left Foot',
+    '3.8a': 'Leg Agility – Right Leg',
+    '3.8b': 'Leg Agility – Left Leg',
+    '3.9':  'Arising from Chair',
+    '3.10': 'Gait',
+    '3.11': 'Freezing of Gait',
+    '3.12': 'Postural Stability',
+    '3.13': 'Posture',
+    '3.15a': 'Postural Tremor – Right Hand',
+    '3.15b': 'Postural Tremor – Left Hand',
+    '3.16a': 'Kinetic Tremor – Right Hand',
+    '3.16b': 'Kinetic Tremor – Left Hand',
+    '3.17': 'Rest Tremor – All Limbs',
+}
 
 # /home persists across restarts on Azure App Service; everything else is ephemeral.
 UPLOADS_DIR = '/home/uploads'
@@ -584,9 +638,9 @@ def healthz():
     and so it exercises the same interpreter the pipeline itself uses.
     """
     probe = (
-        'import json, sys; out = {}\n'
+        'import json, os, sys; out = {}\n'
         'for mod in ("numpy", "cv2", "mediapipe", "pandas", "matplotlib",\n'
-        '            "onnxruntime", "rtmlib"):\n'
+        '            "onnxruntime", "rtmlib", "imageio_ffmpeg"):\n'
         '    try:\n'
         '        m = __import__(mod)\n'
         '        out[mod] = {"ok": True, "version": getattr(m, "__version__", "?"),\n'
@@ -597,35 +651,46 @@ def healthz():
         '    import mediapipe as mp; out["mp.solutions"] = {"ok": hasattr(mp, "solutions")}\n'
         'except Exception as e:\n'
         '    out["mp.solutions"] = {"ok": False, "error": str(e)}\n'
-        f'sys.path.insert(0, {repr(MOTION_DIR)})\n'
-        'try:\n'
-        '    import extract; out["motion.extract"] = {"ok": True}\n'
-        'except Exception as e:\n'
-        '    out["motion.extract"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
         'try:\n'
         '    from rtmlib import Wholebody; out["rtmlib.Wholebody"] = {"ok": True}\n'
         'except Exception as e:\n'
         '    out["rtmlib.Wholebody"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
         'try:\n'
-        '    import profiles; p = profiles.get("foot"); out["profiles.foot"] = {"ok": True, "model": p["model"]}\n'
-        'except Exception as e:\n'
-        '    out["profiles.foot"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
-        'try:\n'
-        '    import profiles; p = profiles.get("toe_tap"); out["profiles.toe_tap"] = {"ok": True, "model": p["model"], "pixel_win": p.get("pixel_smooth_window")}\n'
-        'except Exception as e:\n'
-        '    out["profiles.toe_tap"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
-        'try:\n'
-        '    import profiles; p = profiles.get("rest_tremor"); out["profiles.rest_tremor"] = {"ok": True, "model": p["model"], "pixel_win": p.get("pixel_smooth_window")}\n'
-        'except Exception as e:\n'
-        '    out["profiles.rest_tremor"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
-        'try:\n'
         '    from spinepose import PoseTracker as SpinePT, SpinePoseEstimator; out["spinepose"] = {"ok": True}\n'
         'except Exception as e:\n'
         '    out["spinepose"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
-        'try:\n'
-        '    import profiles; p = profiles.get("spine"); out["profiles.spine"] = {"ok": True, "model": p["model"]}\n'
-        'except Exception as e:\n'
-        '    out["profiles.spine"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
+        f'md = {repr(MOTION_DIR)}\n'
+        'sys.path.insert(0, md)\n'
+        # File presence first: a partial deploy is reported as the missing file
+        # it is, rather than as whatever transitive import happens to fail.
+        f'expected = {repr(list(MOTION_MODULES))}\n'
+        'present = sorted(f[:-3] for f in os.listdir(md) if f.endswith(".py")) if os.path.isdir(md) else []\n'
+        'missing = [m for m in expected if m not in present]\n'
+        'out["motion.files"] = {"ok": not missing, "dir": md,\n'
+        '                       "expected": len(expected), "present": len(present),\n'
+        '                       "missing": missing}\n'
+        # Then import every pipeline module, not just the ones that happen to be
+        # reachable from extract. skeleton3d in particular is only used at the
+        # final render step, so an import-time check is the only cheap way to
+        # catch it before a full tracking pass has already been spent.
+        'for mod in expected:\n'
+        '    try:\n'
+        '        __import__(mod)\n'
+        '        out["motion." + mod] = {"ok": True}\n'
+        '    except Exception as e:\n'
+        '        out["motion." + mod] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
+        # Every kind the upload form can dispatch to, so a profile that raises
+        # for one subject cannot hide behind the others.
+        f'kinds = {repr(list(PROFILE_KINDS))}\n'
+        'for k in kinds:\n'
+        '    try:\n'
+        '        import profiles; p = profiles.get(k)\n'
+        '        out["profiles." + k] = {"ok": True, "model": p["model"],\n'
+        '                                "pixel_win": p.get("pixel_smooth_window")}\n'
+        '    except Exception as e:\n'
+        '        out["profiles." + k] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
+        # Single verdict so a deploy can be checked without reading every key.
+        'out["ok"] = all(v.get("ok") for v in out.values() if isinstance(v, dict))\n'
         'print(json.dumps(out))\n'
     )
     proc = subprocess.run(
@@ -633,7 +698,62 @@ def healthz():
     )
     if proc.returncode != 0:
         return jsonify(ok=False, stderr=(proc.stderr or '')[-3000:]), 500
-    return app.response_class(proc.stdout, mimetype='application/json')
+    # 503 on any failed check so a deploy can be gated on the status code alone.
+    # Safe to fail loudly here: healthCheckPath is unset and the platform warmup
+    # probe hits '/', so a red /healthz cannot stop the container from starting.
+    try:
+        code = 200 if json.loads(proc.stdout).get('ok') else 503
+    except (ValueError, AttributeError):
+        code = 500
+    return app.response_class(proc.stdout, mimetype='application/json', status=code)
+
+
+def _meta_path(save_path):
+    return save_path + '.meta.json'
+
+
+def _write_upload_meta(save_path, job_id, test_id, kind, original_name, size):
+    """Store the test an upload was recorded for, as a sidecar next to the zip."""
+    meta = {
+        'job_id': job_id,
+        'test': test_id or None,
+        'test_label': TEST_LABELS.get(test_id),
+        'kind': kind,
+        'original_name': original_name,
+        'size': size,
+        'uploaded_utc': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+        'status': 'processing',
+    }
+    try:
+        with open(_meta_path(save_path), 'w', encoding='utf-8') as fh:
+            json.dump(meta, fh, indent=2)
+    except OSError:
+        pass  # non-fatal — never fail an upload over bookkeeping
+
+
+def _update_upload_meta(save_path, **fields):
+    """Patch an existing sidecar; silently no-op if it was never written."""
+    path = _meta_path(save_path)
+    try:
+        with open(path, encoding='utf-8') as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError):
+        return
+    meta.update(fields)
+    try:
+        with open(path, 'w', encoding='utf-8') as fh:
+            json.dump(meta, fh, indent=2)
+    except OSError:
+        pass
+
+
+def _read_upload_meta(name):
+    """Sidecar for an uploads/ filename, or {} if there is none."""
+    try:
+        with open(os.path.join(UPLOADS_DIR, name + '.meta.json'), encoding='utf-8') as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
 
 
 @app.route('/upload', methods=['POST'])
@@ -648,24 +768,9 @@ def upload():
 
     # Map the MDS-UPDRS test ID to the pipeline kind (torso/hand).
     # The old 'subject' field is kept as a fallback for direct API callers.
-    _test_to_kind = {
-        '3.4a': 'hand',  '3.4b': 'hand',
-        '3.5a': 'hand',  '3.5b': 'hand',
-        '3.6a': 'hand',  '3.6b': 'hand',
-        # 3.7 (Toe Tapping): lower-leg-only profile, 13-frame pixel smoothing.
-        # 3.8 (Leg Agility): full-body foot profile for wider context.
-        '3.7a': 'toe_tap', '3.7b': 'toe_tap',
-        '3.8a': 'foot',    '3.8b': 'foot',
-        '3.9':  'torso', '3.10': 'torso', '3.11': 'torso',
-        '3.12': 'torso', '3.13': 'spine',
-        '3.15a': 'hand', '3.15b': 'hand',
-        '3.16a': 'hand', '3.16b': 'hand',
-        # 3.17 (Rest Tremor): all four limbs in one recording, 3-frame pixel smoothing.
-        '3.17': 'rest_tremor',
-    }
     test_id = request.form.get('test', '')
-    if test_id in _test_to_kind:
-        subject = _test_to_kind[test_id]
+    if test_id in TEST_TO_KIND:
+        subject = TEST_TO_KIND[test_id]
     else:
         subject = request.form.get('subject', 'auto')
         if subject not in ('auto', 'torso', 'hand'):
@@ -684,11 +789,20 @@ def upload():
     except OSError:
         pass  # non-fatal; processing continues even if the save fails
 
+    # Record WHICH test this recording was for, next to the recording itself.
+    # Without this a stored upload cannot be matched back to its MDS-UPDRS item:
+    # the five recordings stranded by a failed batch on 2026-09-24 could only be
+    # re-run by guessing, because nothing tied them to a test. A sidecar .json
+    # keeps older uploads valid — they simply have no metadata.
+    _write_upload_meta(save_path, job_id, test_id, subject, f.filename, len(zip_bytes))
+
     with _lock:
         _jobs[job_id] = {'status': 'processing', 'result': None, 'error': None,
                          'percent': 0, 'stage': 'Queued…'}
 
-    threading.Thread(target=_run_job, args=(job_id, zip_bytes, tracker, subject), daemon=True).start()
+    threading.Thread(target=_run_job,
+                     args=(job_id, zip_bytes, tracker, subject, save_path),
+                     daemon=True).start()
     return jsonify(job_id=job_id)
 
 
@@ -761,26 +875,50 @@ def admin_uploads():
     entries = []
     for name in os.listdir(UPLOADS_DIR):
         path = os.path.join(UPLOADS_DIR, name)
-        if not os.path.isfile(path):
+        # Sidecars describe the recording next to them; they are not uploads.
+        if not os.path.isfile(path) or name.endswith('.meta.json'):
             continue
         size_kb = os.path.getsize(path) // 1024
         mtime = datetime.utcfromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M UTC')
-        entries.append((name, size_kb, mtime))
+        entries.append((name, size_kb, mtime, _read_upload_meta(name)))
     entries.sort(key=lambda e: e[2], reverse=True)
 
     token = request.args['token']
-    rows = ''.join(
-        f'<tr><td style="padding:4px 12px">{name}</td>'
-        f'<td style="padding:4px 12px">{size_kb} KB</td>'
-        f'<td style="padding:4px 12px">{mtime}</td>'
-        f'<td style="padding:4px 12px"><a href="/admin/download/{name}?token={token}">download</a></td></tr>'
-        for name, size_kb, mtime in entries
-    )
+
+    def _cells(name, size_kb, mtime, meta):
+        # Uploads predating the sidecar have no test recorded, and it cannot be
+        # recovered after the fact — say so rather than implying 'none'.
+        test = meta.get('test')
+        label = meta.get('test_label') or ''
+        test_cell = f'{test} · {label}' if test else '<i>not recorded</i>'
+        kind = meta.get('kind') or '—'
+        status = meta.get('status') or '<i>unknown</i>'
+        colour = {'done': '#0a0', 'error': '#c00'}.get(meta.get('status'), '#888')
+        err = meta.get('error')
+        if err:
+            status += f'<br><span style="font-size:11px">{err[:120]}</span>'
+        return (f'<tr><td style="padding:4px 12px">{name}</td>'
+                f'<td style="padding:4px 12px">{test_cell}</td>'
+                f'<td style="padding:4px 12px">{kind}</td>'
+                f'<td style="padding:4px 12px;color:{colour}">{status}</td>'
+                f'<td style="padding:4px 12px">{size_kb} KB</td>'
+                f'<td style="padding:4px 12px">{mtime}</td>'
+                f'<td style="padding:4px 12px">'
+                f'<a href="/admin/download/{name}?token={token}">download</a></td></tr>')
+
+    rows = ''.join(_cells(*e) for e in entries)
+    n_failed = sum(1 for e in entries if e[3].get('status') == 'error')
+    banner = (f'<p style="color:#c00">{n_failed} upload(s) recorded as failed.</p>'
+              if n_failed else '')
     html = (
         '<html><body style="font-family:monospace">'
         f'<h3>Saved uploads ({len(entries)} files)</h3>'
+        + banner +
         '<table border="1" cellspacing="0"><tr>'
         '<th style="padding:4px 12px">File</th>'
+        '<th style="padding:4px 12px">Test</th>'
+        '<th style="padding:4px 12px">Kind</th>'
+        '<th style="padding:4px 12px">Result</th>'
         '<th style="padding:4px 12px">Size</th>'
         '<th style="padding:4px 12px">Uploaded</th>'
         '<th></th></tr>'
@@ -862,7 +1000,7 @@ def admin_download(filename):
 # ---------------------------------------------------------------------------
 
 def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
-             subject: str = 'auto') -> None:
+             subject: str = 'auto', save_path: str = '') -> None:
     work = tempfile.mkdtemp(prefix='lidar_')
     try:
         # --- Extract ZIP ---
@@ -1085,6 +1223,12 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
             _jobs[job_id] = {'status': 'done', 'result': result_bytes, 'error': None,
                              'percent': 100, 'stage': 'Complete',
                              'movie': movie}
+        # Outcome goes on the stored recording, not just in memory. _jobs is
+        # wiped on restart, so without this a batch that failed weeks ago is
+        # invisible — which is exactly how the 2026-09-24 failures went
+        # unnoticed until someone went looking.
+        if save_path:
+            _update_upload_meta(save_path, status='done', error=None)
 
     except Exception as exc:
         with _lock:
@@ -1092,6 +1236,8 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
             _jobs[job_id] = {'status': 'error', 'result': None, 'error': str(exc),
                              'percent': prev.get('percent', 0),
                              'stage': prev.get('stage', '')}
+        if save_path:
+            _update_upload_meta(save_path, status='error', error=str(exc)[:500])
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
