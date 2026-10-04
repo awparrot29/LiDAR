@@ -5,14 +5,19 @@ knees), fifteen for a hand (three flexion angles per finger). The arithmetic and
 the output layout are identical, and match the gait pipeline so anything
 downstream is already familiar:
 
-    <out>/data/<landmark>.csv       x, y, z in metres, one row per frame
-    <out>/data/<joint> angle.csv    degrees, one row per frame
-    <out>/graphs/<joint> angle.png
-    <out>/graphs/<landmark> distance.png
+    <out>/data/<test>_<landmark>.csv       x_m, y_m, z_m, one row per frame
+    <out>/data/<test>_<joint>_angle.csv    angle_deg, one row per frame
+    <out>/graphs/<test>_<joint>_angle.png
+    <out>/graphs/<test>_<landmark>_distance.png
+
+Naming and column headers come from csvout, which the torso pipeline also uses,
+so both produce identically-spelled output.
 """
 import os
 
 import numpy as np
+
+import csvout
 
 UNTRACKED = (0, 0, 0)
 
@@ -64,16 +69,15 @@ def _plot(x, y, title, ylabel, path, color=None):
     plt.close()
 
 
-def write(arrays, angle_series, profile, out_dir, fps=60.0, graphs=True):
+def write(arrays, angle_series, profile, out_dir, fps=60.0, graphs=True,
+          test_id=None):
     data_dir = os.path.join(out_dir, "data")
     os.makedirs(data_dir, exist_ok=True)
 
     for name in profile["landmarks"]:
-        np.savetxt(os.path.join(data_dir, f"{name}.csv"),
-                   np.asarray(arrays[name], float), delimiter=",", fmt="%s")
+        csvout.write_point(data_dir, name, arrays[name], test_id=test_id, fps=fps)
     for pivot, series in angle_series.items():
-        np.savetxt(os.path.join(data_dir, f"{pivot} angle.csv"),
-                   np.asarray(series, float), delimiter=",", fmt="%s")
+        csvout.write_angle(data_dir, pivot, series, test_id=test_id, fps=fps)
 
     if not graphs:
         return
@@ -82,13 +86,13 @@ def write(arrays, angle_series, profile, out_dir, fps=60.0, graphs=True):
     for pivot, series in angle_series.items():
         t = np.arange(len(series)) / fps
         _plot(t, series, f"{pivot} angle over time", "Angle (degrees)",
-              os.path.join(gdir, f"{pivot} angle.png"), color="purple")
+              csvout.graph_path(gdir, pivot, "angle", test_id), color="purple")
     for name in profile["traces"]:
         arr = np.asarray(arrays[name], float)
         z = np.where(np.all(arr == 0, axis=1), np.nan, arr[:, 2])
         t = np.arange(len(z)) / fps
         _plot(t, z, f"Z distance over time ({name})", "Z distance (m)",
-              os.path.join(gdir, f"{name} distance.png"))
+              csvout.graph_path(gdir, name, "distance", test_id))
 
 
 def summary(arrays, angle_series, profile):

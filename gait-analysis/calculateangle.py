@@ -2,6 +2,29 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 
+# Output naming and CSV headers are shared with the motion-analysis profiles so
+# a torso result is spelled exactly like a hand or foot one. csvout lives next
+# door rather than being duplicated here — this project has already lost time to
+# two copies of the same file drifting apart.
+#
+# Loaded by file path, NOT by adding motion-analysis to sys.path. Both folders
+# contain background.py, depthsmooth.py, sessiongeom.py and skeleton3d.py, so
+# putting that directory on the path makes pipelandmark.py's `import background`
+# resolve to the motion-analysis copy, which has a different signature — a
+# TypeError deep inside landmark extraction, long after the import that caused
+# it. Importing the single module directly keeps the two packages isolated.
+def _load_csvout():
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        os.pardir, 'motion-analysis', 'csvout.py')
+    spec = importlib.util.spec_from_file_location('csvout', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+csvout = _load_csvout()
+
 # Bumped whenever the coordinate geometry changes, so landmark caches written by
 # an older version are discarded instead of silently producing wrong output.
 # 1 = orientation-aware rotation + corrected intrinsics scaling.
@@ -77,7 +100,7 @@ def plot_angle_over_time(angles, bp, save_path):
     plt.close()
 
 
-def main(folder=None, bp=None):
+def main(folder=None, bp=None, test_id=None):
     # If not being used as module get the input folder and requested body part
     if folder is None:
         folder = input("Folder name: ")
@@ -138,22 +161,26 @@ def main(folder=None, bp=None):
         for i in range(len(l1)):
             l4.append(calculate_angle(l2[i], l1[i], l3[i]))
 
-        # Save the x/y/z for each body part and the angle data as csv files
+        # Save the x/y/z for each body part and the angle data as csv files.
+        # Names and headers come from csvout: test-id prefix, underscores, and
+        # a unit on every column.
         save_dir = f'charts/{folder}/data'
         os.makedirs(save_dir, exist_ok=True)
-        np.savetxt(f'charts/{folder}/data/{input1}.csv', l1, delimiter=',', fmt='%s')
-        np.savetxt(f'charts/{folder}/data/{input2}.csv', l2, delimiter=',', fmt='%s')
-        np.savetxt(f'charts/{folder}/data/{input3}.csv', l3, delimiter=',', fmt='%s')
-        np.savetxt(f'charts/{folder}/data/{input1} angle.csv', l4, delimiter=',', fmt='%s')
+        for name, coords in ((input1, l1), (input2, l2), (input3, l3)):
+            csvout.write_point(save_dir, name, coords, test_id=test_id, fps=60.0)
+        csvout.write_angle(save_dir, input1, l4, test_id=test_id, fps=60.0)
 
         # Plot and save charts for each point's x, y, z over time
-        os.makedirs(f"charts/{folder}/graphs", exist_ok=True)
-        plot_point_over_time(l1, input1, f'charts/{folder}/graphs/{input1} distance.png')
-        plot_point_over_time(l2, input2, f'charts/{folder}/graphs/{input2} distance.png')
-        plot_point_over_time(l3, input3, f'charts/{folder}/graphs/{input3} distance.png')
+        graph_dir = f"charts/{folder}/graphs"
+        os.makedirs(graph_dir, exist_ok=True)
+        for name, coords in ((input1, l1), (input2, l2), (input3, l3)):
+            plot_point_over_time(
+                coords, name,
+                csvout.graph_path(graph_dir, name, 'distance', test_id))
 
         # Plot and save angle over time
-        plot_angle_over_time(l4, input1, f'charts/{folder}/graphs/{input1} angle.png')
+        plot_angle_over_time(
+            l4, input1, csvout.graph_path(graph_dir, input1, 'angle', test_id))
 
 if __name__ == '__main__':
     main()

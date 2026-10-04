@@ -7,11 +7,15 @@ figure out.
     python process_session.py session.zip --no-movie -o results
 
 Writes, under <out>/:
-    data/<landmark>.csv      x, y, z in metres, one row per frame
-    data/<joint> angle.csv   degrees, one row per frame
+    data/<landmark>.csv      x_m, y_m, z_m, one row per frame
+    data/<joint>_angle.csv   angle_deg, one row per frame
     graphs/*.png             angle and z-distance traces
     skeleton.mp4             two-view 3D stick figure, to verify the output
+    rgb.mp4 / lidar.mp4      what the camera and the depth sensor saw
     summary.txt              tracking rate and per-angle ranges
+
+Pass --test 3.7a to prefix every one of those with the MDS-UPDRS item, so
+results from several tests can be extracted into one folder.
 
 Subject kind is detected from the recording — lower-body visibility separates a
 torso from a close-up hand cleanly (measured 0.99 against 0.00). `--kind` overrides
@@ -25,8 +29,10 @@ import tempfile
 import zipfile
 
 import angles
+import csvout
 import detect
 import extract
+import preview
 import profiles
 import skeleton3d
 
@@ -60,7 +66,8 @@ def extract_zip(path, dest):
     raise SystemExit("No Stray Scanner recording found inside the zip")
 
 
-def run(session, kind=None, out_dir=None, movie=True, graphs=True, max_hands=1):
+def run(session, kind=None, out_dir=None, movie=True, graphs=True, max_hands=1,
+        test_id=None):
     """Process one already-extracted session folder. Returns the output path."""
     if kind is None:
         kind, ev = detect.detect(session)
@@ -76,7 +83,8 @@ def run(session, kind=None, out_dir=None, movie=True, graphs=True, max_hands=1):
 
     out_dir = out_dir or os.path.join(session, "output", kind)
     os.makedirs(out_dir, exist_ok=True)
-    angles.write(arrays, angle_series, profile, out_dir, fps=fps, graphs=graphs)
+    angles.write(arrays, angle_series, profile, out_dir, fps=fps, graphs=graphs,
+                 test_id=test_id)
 
     text = angles.summary(arrays, angle_series, profile)
     with open(os.path.join(out_dir, "summary.txt"), "w", encoding="utf-8") as fh:
@@ -85,12 +93,25 @@ def run(session, kind=None, out_dir=None, movie=True, graphs=True, max_hands=1):
     print("\n" + text)
 
     if movie:
+        name = csvout.stem("skeleton", test_id) + ".mp4"
         try:
             path = skeleton3d.render(arrays, profile,
-                                     os.path.join(out_dir, MOVIE_NAME), fps=fps)
+                                     os.path.join(out_dir, name), fps=fps)
             print(f"\nstick figure: {path}")
         except Exception as exc:
             print(f"\nstick figure skipped ({type(exc).__name__}: {exc})")
+
+        # Raw camera and raw LiDAR, rotated the same way the tracker saw them.
+        # Rendered alongside the skeleton so a bad result can be traced to the
+        # camera, the depth sensor, or the tracker without re-running anything.
+        rgb, lidar = preview.render_both(
+            session,
+            os.path.join(out_dir, csvout.stem("rgb", test_id) + ".mp4"),
+            os.path.join(out_dir, csvout.stem("lidar", test_id) + ".mp4"),
+            fps=fps)
+        for p in (rgb, lidar):
+            if p:
+                print(f"preview: {p}")
     return out_dir
 
 
@@ -104,6 +125,10 @@ def main(argv=None):
     ap.add_argument("--no-movie", action="store_true")
     ap.add_argument("--no-graphs", action="store_true")
     ap.add_argument("--max-hands", type=int, default=1)
+    ap.add_argument("--test", default=None, metavar="ID",
+                    help="MDS-UPDRS item this recording is for, e.g. 3.7a. "
+                         "Prefixes every output filename so results from "
+                         "several tests can share a folder.")
     args = ap.parse_args(argv)
 
     tmp = None
@@ -124,7 +149,7 @@ def main(argv=None):
                                f"{base}_results")
         out_dir = run(session, kind=args.kind, out_dir=out,
                       movie=not args.no_movie, graphs=not args.no_graphs,
-                      max_hands=args.max_hands)
+                      max_hands=args.max_hands, test_id=args.test)
         print(f"\nOutput: {out_dir}")
     finally:
         if tmp:

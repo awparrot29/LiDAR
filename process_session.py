@@ -28,6 +28,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 GAIT_DIR = os.path.join(HERE, "gait-analysis")
 MOTION_DIR = os.path.join(HERE, "motion-analysis")
 MOVIE_NAME = "gait_skeleton_3d.mp4"
+# Raw camera and raw LiDAR, rendered beside the skeleton so a bad result can be
+# traced to the sensor rather than the tracker.
+RGB_NAME = "preview_rgb.mp4"
+DEPTH_NAME = "preview_lidar.mp4"
 TRACKERS = ("mediapipe", "rtmpose")
 KINDS = ("auto", "torso", "hand")
 
@@ -101,7 +105,7 @@ def detect_kind(session_path):
     return (kind if kind in ("torso", "hand") else "torso"), why
 
 
-def build_script(session, tracker, want_movie, kind="torso"):
+def build_script(session, tracker, want_movie, kind="torso", test_id=None):
     if kind == "hand":
         # One engine handles both subjects; motion-analysis writes data/ under
         # the folder it is given, so charts/<session> puts the CSVs exactly
@@ -115,16 +119,20 @@ def build_script(session, tracker, want_movie, kind="torso"):
             '_p = profiles.get("hand")',
             f'_a, _g = extract.extract_all_landmarks({session!r}, kind="hand")',
             "_ang = angles.compute(_a, _p)",
-            f"angles.write(_a, _ang, _p, {out_rel!r}, fps=60.0, graphs=True)",
+            f"angles.write(_a, _ang, _p, {out_rel!r}, fps=60.0, graphs=True, "
+            f"test_id={test_id!r})",
         ]
         if want_movie:
             lines += ["import skeleton3d as _s3",
-                      f"_s3.render(_a, _p, {MOVIE_NAME!r}, fps=60.0)"]
+                      f"_s3.render(_a, _p, {MOVIE_NAME!r}, fps=60.0)",
+                      "import preview",
+                      f"preview.render_both({session!r}, {RGB_NAME!r}, "
+                      f"{DEPTH_NAME!r}, fps=60.0)"]
         return "; ".join(lines)
-    return _build_torso_script(session, tracker, want_movie)
+    return _build_torso_script(session, tracker, want_movie, test_id)
 
 
-def _build_torso_script(session, tracker, want_movie):
+def _build_torso_script(session, tracker, want_movie, test_id=None):
     data_rel = os.path.join("charts", session, "data")
     lines = [
         "import sys, os",
@@ -137,11 +145,16 @@ def _build_torso_script(session, tracker, want_movie):
         lines += ["import pipelandmark_rtmpose as _t",
                   'sys.modules["pipelandmark"] = _t']
     lines += ["import calculateangle",
-              f"calculateangle.main(folder={session!r})"]
+              f"calculateangle.main(folder={session!r}, test_id={test_id!r})"]
     if want_movie:
         lines += ["import skeleton3d",
-                  f"_lm = skeleton3d.load_landmarks({data_rel!r})",
-                  f"skeleton3d.render_movie(_lm, {MOVIE_NAME!r})"]
+                  f"_lm = skeleton3d.load_landmarks({data_rel!r}, "
+                  f"test_id={test_id!r})",
+                  f"skeleton3d.render_movie(_lm, {MOVIE_NAME!r})",
+                  f"sys.path.insert(0, {MOTION_DIR!r})",
+                  "import preview",
+                  f"preview.render_both({session!r}, {RGB_NAME!r}, "
+                  f"{DEPTH_NAME!r}, fps=60.0)"]
     return "; ".join(lines)
 
 
@@ -221,8 +234,13 @@ def main(argv=None):
     p.add_argument("--tracker", choices=TRACKERS, default="mediapipe",
                    help="pose model: mediapipe (default, faster) or rtmpose "
                         "(RTMPose-m via ONNX Runtime)")
+    p.add_argument("--test", default=None, metavar="ID",
+                   help="MDS-UPDRS item this recording is for, e.g. 3.7a. "
+                        "Prefixes every output filename so results from "
+                        "several tests can share a folder.")
     p.add_argument("--no-movie", action="store_true",
-                   help="write only the CSVs and skip the 3D render")
+                   help="write only the CSVs, and skip the 3D, camera and "
+                        "LiDAR renders")
     p.add_argument("--keep-graphs", action="store_true",
                    help="also copy the per-joint PNG graphs the pipeline makes")
     p.add_argument("--timeout", type=int, default=3600,
@@ -276,7 +294,8 @@ def main(argv=None):
         os.chdir(work)
         proc = subprocess.Popen(
             [sys.executable, "-u", "-c",
-             build_script(session, args.tracker, not args.no_movie, kind)],
+             build_script(session, args.tracker, not args.no_movie, kind,
+                          args.test)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
         bar = Progress(args.quiet)
@@ -309,11 +328,13 @@ def main(argv=None):
         for name in csvs:
             shutil.copy2(os.path.join(data_dir, name), os.path.join(out_dir, name))
 
-        movie_src = os.path.join(work, MOVIE_NAME)
-        movie_out = None
-        if os.path.exists(movie_src):
-            movie_out = os.path.join(out_dir, f"{base}_{MOVIE_NAME}")
-            shutil.copy2(movie_src, movie_out)
+        movies_out = []
+        for src_name in (MOVIE_NAME, RGB_NAME, DEPTH_NAME):
+            src = os.path.join(work, src_name)
+            if os.path.exists(src):
+                dst = os.path.join(out_dir, f"{base}_{src_name}")
+                shutil.copy2(src, dst)
+                movies_out.append(dst)
 
         graphs = 0
         if args.keep_graphs:
@@ -331,9 +352,9 @@ def main(argv=None):
                 print(f"  {note}")
             print(f"\nWrote to {out_dir}")
             print(f"  {len(csvs)} CSV files")
-            if movie_out:
-                mb = os.path.getsize(movie_out) / 1e6
-                print(f"  {os.path.basename(movie_out)}  ({mb:.1f} MB)")
+            for path in movies_out:
+                mb = os.path.getsize(path) / 1e6
+                print(f"  {os.path.basename(path)}  ({mb:.1f} MB)")
             if graphs:
                 print(f"  graphs/  ({graphs} PNGs)")
     finally:
