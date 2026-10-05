@@ -471,9 +471,10 @@ HTML = r"""<!doctype html>
     <b>camera</b>, the <b>LiDAR depth</b>, and a <b>3D stick figure</b> with bones
     drawn between the joints. Every file is named for the test you chose
     (<code>3.7a_left_knee.csv</code>), and every column carries its unit in the
-    header row: <code>x_m</code>, <code>y_m</code>, <code>z_m</code>,
-    <code>angle_deg</code>. Fingertip files also carry a <code>time_s</code>
-    column. All axes are real-world distances from the camera.<br><br>
+    header row — <code>time_s,x_m,y_m,z_m</code> for a joint's position and
+    <code>time_s,angle_deg</code> for an angle, so every row is stamped with the
+    second it was captured. All axes are real-world distances from the
+    camera.<br><br>
     <b>Note:</b> Processing takes 5&nbsp;–&nbsp;15&nbsp;minutes depending on video length.
     Keep this tab open while it runs.
   </div>

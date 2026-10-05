@@ -7,8 +7,8 @@ figure out.
     python process_session.py session.zip --no-movie -o results
 
 Writes, under <out>/:
-    data/<landmark>.csv      x_m, y_m, z_m, one row per frame
-    data/<joint>_angle.csv   angle_deg, one row per frame
+    data/<landmark>.csv      time_s, x_m, y_m, z_m — one row per frame
+    data/<joint>_angle.csv   time_s, angle_deg — one row per frame
     graphs/*.png             angle and z-distance traces
     skeleton.mp4             two-view 3D stick figure, to verify the output
     rgb.mp4 / lidar.mp4      what the camera and the depth sensor saw

@@ -3,20 +3,22 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 import calculateangle
+from calculateangle import csvout
 
-# Get folder
+# Get folder, and the MDS-UPDRS item the CSVs were written under (blank if the
+# run did not name one) — csvout.stem needs it to rebuild the filename.
 folder = input("Folder name: ")
+test_id = input("Test id (e.g. 3.10, blank if none): ").strip() or None
+
 for bp in ('left elbow', 'left shoulder', 'left wrist', 'left knee', 'left hip', 'left ankle', 'right elbow', 'right shoulder', 'right wrist', 'right knee', 'right hip', 'right ankle'):
-    if not os.path.exists(f"charts/{folder}/data/{bp}.csv"):
-        calculateangle.main(folder, bp)
+    path = f"charts/{folder}/data/{csvout.stem(bp, test_id)}.csv"
+    if not os.path.exists(path):
+        calculateangle.main(folder, bp, test_id=test_id)
 
-    # Read z data from csv file for that body part
-    df = pd.read_csv(f"charts/{folder}/data/{bp}.csv", usecols=[2])
-    df.columns = [bp]
-
-    # Align time data (assuming video is 60 fps)
-    df['Time'] = df.index / 60
-    df = df[['Time', bp]]
+    # Read time and z straight from the file. Both are named columns now, so
+    # there is no need to count positions or synthesise time from the row index.
+    df = pd.read_csv(path, usecols=[csvout.TIME_HEADER, 'z_m'])
+    df = df.rename(columns={csvout.TIME_HEADER: 'Time', 'z_m': bp})
 
     # Get arrays of time and distance data
     x = df['Time'].values
@@ -42,4 +44,5 @@ for bp in ('left elbow', 'left shoulder', 'left wrist', 'left knee', 'left hip',
     plt.grid(True)
     plt.tight_layout()
     os.makedirs(f"charts/{folder}/detrended", exist_ok=True)
-    plt.savefig(f"charts/{folder}/detrended/{bp} Detrended.png")
+    plt.savefig(f"charts/{folder}/detrended/"
+                f"{csvout.stem(bp + ' detrended', test_id)}.png")

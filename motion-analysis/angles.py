@@ -5,8 +5,8 @@ knees), fifteen for a hand (three flexion angles per finger). The arithmetic and
 the output layout are identical, and match the gait pipeline so anything
 downstream is already familiar:
 
-    <out>/data/<test>_<landmark>.csv       x_m, y_m, z_m, one row per frame
-    <out>/data/<test>_<joint>_angle.csv    angle_deg, one row per frame
+    <out>/data/<test>_<landmark>.csv       time_s, x_m, y_m, z_m — one row per frame
+    <out>/data/<test>_<joint>_angle.csv    time_s, angle_deg — one row per frame
     <out>/graphs/<test>_<joint>_angle.png
     <out>/graphs/<test>_<landmark>_distance.png
 

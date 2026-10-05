@@ -79,17 +79,18 @@ def bone_color(a, b):
 def load_landmarks(data_dir, test_id=None):
     """Load {landmark name: (n_frames, 3) array} from a charts data folder.
 
-    skiprows=1 for the `x_m,y_m,z_m` header csvout writes. These files carried
-    no header before 2026-10-04; an older CSV read through here would silently
-    lose its first frame rather than raise, so regenerate rather than mixing
-    old and new output.
+    csvout writes `time_s,x_m,y_m,z_m`, so skip the header row and take
+    columns 1-3; column 0 is time and is not wanted here. These files carried
+    no header and no time column before 2026-10-04 — an older CSV read through
+    here would come back shifted by one column and short one frame, rather than
+    raising, so regenerate rather than mixing old and new output.
     """
     out = {}
     for name in LANDMARKS:
         path = os.path.join(data_dir, csvout.stem(name, test_id) + ".csv")
         if not os.path.exists(path):
             raise RuntimeError(f"Missing coordinate CSV: {path}")
-        arr = np.loadtxt(path, delimiter=",", skiprows=1)
+        arr = np.loadtxt(path, delimiter=",", skiprows=1, usecols=(1, 2, 3))
         if arr.ndim == 1:                    # single-frame session
             arr = arr.reshape(1, 3)
         out[name] = arr

@@ -12,15 +12,20 @@ Three rules, all visible in the output:
    colliding, and a loose CSV still says what it came from.
 2. **Underscores, never spaces.** Spaces in filenames break shell pipelines and
    force quoting in every downstream script.
-3. **Every column states its unit in the header row** — `x_m`, `angle_deg`,
-   `time_s`. Previously these files had no header at all, so a reader had to
-   already know that column 2 was metres.
+3. **Every column states its unit in the header row**, and `time_s` leads every
+   file — `time_s,x_m,y_m,z_m` for a landmark, `time_s,angle_deg` for a joint.
+   Previously these files had no header at all, so a reader had to already know
+   that column 2 was metres.
 
-The header row is new as of 2026-10-04 and is a breaking change for anything
-reading the files back: `np.loadtxt` treats it as data unless given
-`skiprows=1`. gait-analysis/skeleton3d.load_landmarks is the only in-tree
-reader and has been updated. pandas `read_csv` now picks the names up for free,
-which it could not do before.
+Both are breaking changes for anything reading the files back, as of
+2026-10-04:
+
+* `np.loadtxt` treats the header as data unless given `skiprows=1`.
+* Coordinates start at column **1**, not 0 — `usecols=(1, 2, 3)`.
+
+gait-analysis/skeleton3d.load_landmarks and gait-analysis/detrend.py are the
+in-tree readers and have been updated. pandas `read_csv` now picks the names up
+for free, which it could not do before.
 """
 import os
 import re
@@ -65,21 +70,17 @@ def stem(name, test_id=None):
     return f"{safe(test_id)}_{base}" if test_id else base
 
 
-def wants_time(name):
-    """True for the fingertip landmarks.
-
-    The tip trajectories are what tremor and tapping analysis read, and there a
-    frame index is not enough — the sample rate has to be on the page, because
-    the clinically interesting quantity is a frequency. Every other landmark is
-    one row per frame at a known fps and does not need the column.
-    """
-    return str(name).strip().lower().endswith("tip")
-
-
-def write(path, values, header, fps=60.0, with_time=False):
+def write(path, values, header, fps=60.0, with_time=True):
     """Write one measurement CSV with a unit-bearing header row.
 
     `values` is (n,) for a scalar series or (n, k) for coordinates.
+
+    Time leads every file. It was briefly on the fingertip files only — the
+    trajectories tremor and tapping analysis read, where the clinically
+    interesting quantity is a frequency — but a format where column 0 means
+    different things in different files is a trap for anything loading them in
+    bulk. Every row is one frame at a known fps, so the column is derivable
+    either way; writing it down costs ~8 bytes a row and removes the question.
     """
     arr = np.asarray(values, float)
     if arr.ndim == 1:
@@ -101,15 +102,15 @@ def write(path, values, header, fps=60.0, with_time=False):
 
 
 def write_point(data_dir, name, coords, test_id=None, fps=60.0):
-    """One landmark's x/y/z in metres, one row per frame."""
+    """One landmark: `time_s,x_m,y_m,z_m`, one row per frame."""
     path = os.path.join(data_dir, stem(name, test_id) + ".csv")
-    return write(path, coords, POINT_HEADER, fps=fps, with_time=wants_time(name))
+    return write(path, coords, POINT_HEADER, fps=fps)
 
 
 def write_angle(data_dir, name, series, test_id=None, fps=60.0):
-    """One joint's angle in degrees, one row per frame."""
+    """One joint: `time_s,angle_deg`, one row per frame."""
     path = os.path.join(data_dir, stem(f"{name} angle", test_id) + ".csv")
-    return write(path, series, ANGLE_HEADER, fps=fps, with_time=wants_time(name))
+    return write(path, series, ANGLE_HEADER, fps=fps)
 
 
 def graph_path(graph_dir, name, suffix, test_id=None):
