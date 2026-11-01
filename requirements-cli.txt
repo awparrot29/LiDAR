@@ -1,4 +1,4 @@
-# Packages for lidar_cli.py, the offline command-line program.
+# Packages for analyze_recording.py, the offline analysis program.
 # No web server packages (flask, gunicorn): the CLI does not need them.
 # Versions are pinned to the set this was tested with, so an install made
 # months from now from a wheel folder behaves the same.
@@ -7,6 +7,9 @@
 
 numpy==2.4.6
 opencv-python==4.10.0.82
+# mediapipe and rtmlib also install the contrib build, which is the cv2 that
+# actually loads. Pinned so every install uses the same one.
+opencv-contrib-python==5.0.0.93
 # mediapipe 1.x removed the mp.solutions API the pipelines use.
 mediapipe==0.10.14
 matplotlib==3.9.0

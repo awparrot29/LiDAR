@@ -103,6 +103,7 @@ def extract_all_landmarks(folder):
                       min_tracking_confidence=0.5) as pose:
 
         frame_i = 0
+        n_undetected = 0
 
         # Read frames
         while cap.isOpened():
@@ -118,6 +119,8 @@ def extract_all_landmarks(folder):
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             results = pose.process(rgb_frame)
+            if not results.pose_landmarks:
+                n_undetected += 1
 
             if frame_i == 0:
                 print("Loading...")
@@ -183,6 +186,16 @@ def extract_all_landmarks(folder):
             frame_i += 1
 
     cap.release()
+
+    # Same quality summary the motion-analysis pipelines print, so a tracker
+    # dropout is visible instead of hidden behind held positions.
+    if n_undetected:
+        print(f"Warning: no person detected on {n_undetected}/{frame_i} frames "
+              f"(held previous position)")
+    n_samples = frame_i * len(landmark_map)
+    n_usable = sum(sum(1 for v in ok_z[n] if v) for n in landmark_map)
+    print(f"Usable depth: {n_usable}/{n_samples} samples "
+          f"({100.0 * n_usable / max(n_samples, 1):.1f}%)")
 
     # Second pass: average each joint's depth over the neighbouring frames, then
     # project. x and y are derived from the smoothed depth so all three stay

@@ -5,10 +5,296 @@ iPhones/iPads, combining 3D pose estimation with depth data. It handles two kind
 of recording: a **torso** recording of someone walking, and a close-up **hand**
 recording of finger movement. See [Torso vs Hand](#torso-vs-hand).
 
-> **Running without internet access (for example, inside a hospital firewall)?**
-> Use [`lidar_cli.py`](OFFLINE_CLI.md). It covers every MDS-UPDRS test on the
-> website (`--test 3.10`, `--test 3.4a`, ...) and adds a README explaining each
-> output file. See [OFFLINE_CLI.md](OFFLINE_CLI.md) for the one-time setup.
+**Clinical sites: start with [Analysing recordings offline](#analysing-recordings-offline)
+below.** It covers everything needed to install and run the analysis on a
+computer with no internet access.
+
+---
+
+# Analysing recordings offline
+
+`analyze_recording.py` does what the LiDar website does, on your own computer,
+with **no internet connection**. You give it a recording and the MDS-UPDRS
+Part 3 test it was recorded for. It gives you back a ZIP file containing:
+
+- **spreadsheets (CSV)**: the 3D position of each tracked body point and the
+  angle of each joint, in every video frame
+- **three check videos**: a 3D stick figure, the camera video, and the LiDAR
+  depth video
+- **a README file** that explains every file in that ZIP: what each column
+  means, the units, which files matter for that test, and how good the data
+  from this recording was
+
+Contents of this section:
+[What you need](#what-you-need) ·
+[One-time setup](#one-time-setup) ·
+[Recording](#recording) ·
+[Running an analysis](#running-an-analysis) ·
+[Test numbers](#test-numbers) ·
+[The results](#the-results) ·
+[Problems](#problems) ·
+[Privacy](#privacy)
+
+## What you need
+
+- A Windows 10/11 or macOS computer with about **4 GB** of free disk space.
+- **Python 3.11 (64-bit)**. Other versions will not work: one of the required
+  packages (MediaPipe 0.10.14) has no version for Python 3.13 or newer.
+- Recordings made with the **Stray Scanner** app on an iPhone or iPad that has
+  LiDAR (iPhone 12 Pro or newer Pro models, or iPad Pro).
+- **Once only:** access to any computer that *does* have internet access, to
+  download the program, its packages and its models. After that, nothing needs
+  the internet.
+
+## One-time setup
+
+Your IT department may want to do this part. It has two stages: collect
+everything on a computer **with** internet, then install it on the computer
+**without** internet. Use the same operating system on both (for example,
+Windows on both).
+
+### Stage 1: on a computer WITH internet access
+
+1. Install **Python 3.11** from <https://www.python.org/downloads/> (pick the
+   latest 3.11.x release, "Windows installer (64-bit)" or the macOS
+   installer). On Windows, tick **"Add python.exe to PATH"** on the first
+   screen of the installer. Keep the installer file: you need it again in
+   stage 2.
+2. Get this program: on this GitHub page click the green **Code** button, then
+   **Download ZIP**, and unzip it. (Or, with git: `git clone` this repository.)
+3. Open a command window in the program folder:
+   - **Windows:** open the folder in File Explorer, click the address bar,
+     type `cmd` and press Enter.
+   - **Mac:** open **Terminal**, type `cd ` (with a space), drag the folder
+     into the Terminal window, and press Enter.
+4. Download the Python packages into a `wheels` folder (about 460 MB):
+
+   ```bash
+   python -m pip download -r requirements-cli.txt -d wheels
+   ```
+
+   On a Mac, type `python3.11` wherever these instructions say `python`.
+
+5. Download the pose models into a `models` folder (about 650 MB). Every
+   test except the hand tests needs them, because the pip packages do not
+   include them. This step needs the packages installed on this computer
+   first:
+
+   ```bash
+   python -m pip install -r requirements-cli.txt
+   python analyze_recording.py --download-models
+   ```
+
+   It ends with `All models present`.
+
+6. Copy the **whole program folder**, including the new `wheels` and `models`
+   folders, and the Python installer, to a USB drive or network share.
+
+> The `models` folder is not stored on GitHub because some of its files are
+> larger than GitHub allows. That is why step 5 is needed.
+
+### Stage 2: on the computer WITHOUT internet access
+
+1. Install Python 3.11 with the installer you copied (on Windows, tick **"Add
+   python.exe to PATH"** again).
+2. Copy the program folder onto the computer, for example to
+   `C:\LiDAR-Analysis`.
+3. Open a command window in that folder (see stage 1, step 3).
+4. Create a private Python environment for the program and install the
+   packages from the `wheels` folder. Nothing is downloaded:
+
+   **Windows** (in the `cmd` window):
+   ```bat
+   python -m venv .venv
+   .venv\Scripts\activate
+   python -m pip install --no-index --find-links wheels -r requirements-cli.txt
+   ```
+
+   **Mac**:
+   ```bash
+   python3.11 -m venv .venv
+   source .venv/bin/activate
+   python -m pip install --no-index --find-links wheels -r requirements-cli.txt
+   ```
+
+5. Check it works, using the example recording that comes with the program
+   (takes about 5 minutes):
+
+   ```bash
+   python analyze_recording.py example/sample_session.zip --test 3.10
+   ```
+
+   It should finish with `Done` and create `3.10_Gait.zip` in the program
+   folder.
+
+**Every time you open a new command window** to run an analysis, first go to
+the program folder (stage 1, step 3) and switch on the environment:
+`.venv\Scripts\activate` on Windows, or `source .venv/bin/activate` on a Mac.
+The line then starts with `(.venv)`.
+
+## Recording
+
+Record with **Stray Scanner** at **60 frames per second**, with the phone or
+iPad on a **tripod** that does not move during the recording. Positions are
+measured from the camera, so camera movement looks like body movement.
+
+| Test | What should be in view | Distance from camera |
+|---|---|---|
+| Hand tests (3.4, 3.5, 3.6, 3.15, 3.16) | **One** hand only, filling much of the picture. Keep the other hand out of view. | About 0.2 to 0.5 m |
+| Gait, chair rise, freezing, stability (3.9 to 3.12) | The whole body, walking toward or away from the camera | About 1.5 to 4 m |
+| Toe tapping, leg agility (3.7, 3.8) | The legs, with the feet fully in view | As close as possible while keeping the feet in view |
+| Posture (3.13), rest tremor (3.17) | The whole body; for rest tremor, all four limbs | As close as possible while keeping the whole body in view |
+
+The LiDAR measures up to about 5 m; closer gives more detail.
+
+Then get the recording off the device: in the **Files** app find the
+recording's folder (under Stray Scanner), long-press it and choose
+**Compress**. Copy the resulting `.zip` file to the analysis computer (AirDrop,
+cable, or a USB drive). **That `.zip` is what you give the program.** You can
+also give it the unzipped folder.
+
+Name your files so you can tell them apart, for example `p07_gait.zip`.
+
+## Running an analysis
+
+Open a command window in the program folder and switch on the environment (see
+above). Then type:
+
+```bash
+python analyze_recording.py RECORDING --test TEST
+```
+
+- **RECORDING** is the recording's `.zip` file (or unzipped folder). The
+  easiest way to enter it is to **drag the file into the command window**,
+  which types its full path for you. If you type a path that contains spaces,
+  put it in double quotes.
+- **TEST** is the MDS-UPDRS Part 3 item number the recording is for, such as
+  `3.10` for gait or `3.4a` for finger tapping with the right hand. The full
+  list is under [Test numbers](#test-numbers), or type
+  `python analyze_recording.py --list-tests`.
+
+Examples:
+
+```bash
+python analyze_recording.py C:\Recordings\p07_gait.zip --test 3.10
+python analyze_recording.py "C:\Recordings\p07 finger tap R.zip" --test 3.4a
+python analyze_recording.py p07_tremor.zip --test 3.17 -o C:\Results
+python analyze_recording.py p07_tremor.zip --test 3.17 -o C:\Results\p07_rest_tremor.zip
+```
+
+An analysis usually takes **3 to 10 minutes**. A progress line shows how far
+it has got. When it finishes it prints where the results were saved. By
+default that is the folder the command window is in, named after the test
+(e.g. `3.10_Gait.zip`).
+
+These are the same choices as on the website:
+
+| Website | Command line |
+|---|---|
+| Choose a recording | `RECORDING` (required) |
+| MDS-UPDRS Part 3 test menu | `--test TEST` (required) |
+| Tracker: MediaPipe / RTMPose | `--tracker mediapipe` (default) or `--tracker rtmpose`. Only affects gait tests 3.9 to 3.12. Leave at the default unless told otherwise. |
+| Download results | `-o PATH`: a file name ending in `.zip`, or a folder to put it in |
+
+Other options:
+
+| Option | What it does |
+|---|---|
+| `--no-videos` | Leave out the three videos. Much faster, and the spreadsheets are exactly the same. Also leaves out the camera video, which shows the participant's face. |
+| `--graphs` | Also include quick-look graphs (PNG) of every angle and point over time. |
+| `--overwrite` | Replace the results file if one with the same name exists. Without it, the program stops rather than overwrite anything. |
+| `--list-tests` | Show all test numbers. |
+| `--help` | Show all options, including a few advanced ones. |
+
+**Processing a folder of recordings.** Recordings for the same test can be
+processed in one go. For example, in a Windows `cmd` window, this runs every
+`.zip` in `C:\Recordings\gait` as test 3.10 and saves each result under the
+recording's own name in `C:\Results`:
+
+```bat
+for %f in (C:\Recordings\gait\*.zip) do python analyze_recording.py "%f" --test 3.10 -o "C:\Results\%~nf_3.10.zip"
+```
+
+## Test numbers
+
+`a` is always the right side and `b` the left side.
+
+| `--test` | Test | What is measured |
+|---|---|---|
+| `3.4a` / `3.4b` | Finger tapping, right / left hand | Hand: 21 points, 15 finger angles |
+| `3.5a` / `3.5b` | Hand movements, right / left hand | Hand |
+| `3.6a` / `3.6b` | Pronation-supination, right / left hand | Hand |
+| `3.7a` / `3.7b` | Toe tapping, right / left foot | Lower legs and feet: 10 points, ankle angles |
+| `3.8a` / `3.8b` | Leg agility, right / left leg | Whole body and feet: 18 points, 8 angles |
+| `3.9` | Arising from chair | Whole body: 12 joints, 6 angles |
+| `3.10` | Gait | Whole body |
+| `3.11` | Freezing of gait | Whole body |
+| `3.12` | Postural stability | Whole body |
+| `3.13` | Posture | Spine: 14 points, 6 spinal angles |
+| `3.15a` / `3.15b` | Postural tremor, right / left hand | Hand |
+| `3.16a` / `3.16b` | Kinetic tremor, right / left hand | Hand |
+| `3.17` | Rest tremor, all four limbs (covers 3.17a to 3.17d in one recording) | Whole body |
+
+Not available, because they cannot be measured from a skeleton: 3.1 speech,
+3.2 facial expression, 3.3 rigidity, 3.14 global spontaneity of movement,
+3.17e lip/jaw tremor, 3.18 constancy of rest tremor.
+
+## The results
+
+The results ZIP contains, for a gait recording for example:
+
+```
+README_3.10_Gait.txt          explains everything below - read this first
+3.10_left_knee.csv            position of the left knee in every frame
+3.10_left_knee_angle.csv      angle of the left knee in every frame
+...                           (one of each per joint)
+3.10_Gait_skeleton.mp4        3D stick figure, to check the tracking
+3.10_Gait_rgb.mp4             the camera video
+3.10_Gait_lidar.mp4           the LiDAR depth video
+```
+
+- **Position files** have the columns `time_s, x_m, y_m, z_m`: seconds since
+  the start, then the point's position in metres measured from the camera
+  (right, down, and away from the camera).
+- **Angle files** have the columns `time_s, angle_deg`: the joint's angle in
+  degrees (180 = straight).
+- There is one row per video frame (60 per second). The files open directly in
+  Excel, R, SPSS, MATLAB or Python.
+
+The README inside each results ZIP explains all of this in detail and is
+written for that recording. It covers:
+- the coordinate system, with a diagram
+- what each point name means (MCP, PIP and so on)
+- exactly which points each angle is measured between
+- which files matter for that test, with a worked example
+- how good this recording's data was, and how gaps were handled
+- how to work out distances, speeds and frequencies
+- the limits of the measurement
+
+**Watch the skeleton video first.** If the stick figure does not follow the
+person, the numbers are not reliable.
+
+## Problems
+
+| Message or symptom | What to do |
+|---|---|
+| `'python' is not recognized` (Windows) | Python is not installed, or "Add python.exe to PATH" was not ticked. Re-run the installer and tick it. |
+| `No module named ...` | The environment is not switched on. Run `.venv\Scripts\activate` (Windows) or `source .venv/bin/activate` (Mac) in the program folder. |
+| `Error: Cannot find ...` | The recording's path is wrong. Drag the file into the command window instead of typing it. |
+| `Error: which test is this recording for?` | Add `--test` and the item number, e.g. `--test 3.10`. |
+| `Error: Test 3.4 has a right and a left version` | Add `a` (right) or `b` (left): `--test 3.4a`. |
+| `Error: This test needs model files...` | The `models` folder is missing or incomplete. Repeat stage 1, step 5, and copy the `models` folder into the program folder. |
+| `Error: This is not a Stray Scanner recording` | Give the whole recording (the compressed folder), not just the video inside it. |
+| `Error: ... already exists` | Choose another name with `-o`, or add `--overwrite`. |
+| The skeleton video does not follow the person | See the recording advice above: tripod, distance, whole body (or one hand) in view, good lighting. The README's DATA QUALITY section shows how much was tracked. |
+| Installing fails with `The filename or extension is too long` or `No such file or directory` (Windows) | The program folder is too deep inside other folders. Move it to a short path such as `C:\LiDAR-Analysis`, delete the `.venv` folder, and repeat stage 2 from step 4. |
+| PowerShell says running scripts is disabled when activating | Use a `cmd` window instead (type `cmd` in the folder's address bar). |
+
+## Privacy
+
+The recordings, and the `*_rgb.mp4` camera video in each result, show the
+participant, including their face. Handle them as identifiable patient data.
+Use `--no-videos` to produce results that contain only numbers.
 
 ---
 
@@ -94,6 +380,7 @@ measurement noise, so an anonymised recording still analyses the same.
 ---
 
 ## Contents
+- [Analysing recordings offline](#analysing-recordings-offline)
 - [Quick Start](#quick-start--process-a-recording)
 - [Overview](#overview)
 - [Results](#results)
