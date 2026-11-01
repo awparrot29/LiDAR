@@ -5,7 +5,9 @@ Open: http://localhost:5000
 """
 import collections
 import io
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -14,6 +16,7 @@ import threading
 import time
 import uuid
 import zipfile
+from datetime import datetime
 
 from flask import Flask, jsonify, request, send_file
 
@@ -24,6 +27,106 @@ GAIT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gait-analys
 MOTION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'motion-analysis')
 PIPELINE_TIMEOUT = 3000  # seconds
 MOVIE_NAME = 'gait_skeleton_3d.mp4'
+# Raw camera and raw LiDAR, rendered beside the skeleton so a bad result can be
+# traced to the sensor rather than the tracker. Working filenames only — what
+# the user downloads is named from the chosen test by _output_names().
+RGB_NAME = 'preview_rgb.mp4'
+DEPTH_NAME = 'preview_lidar.mp4'
+
+# Every .py that must reach the server for the motion-analysis pipelines to run.
+# A deploy that drops any of these still passes a naive import check, because
+# most are pulled in transitively — extract.py imports background/sessiongeom at
+# module load, and skeleton3d is only touched at the final render step. Keeping
+# the list here lets /healthz and the deploy guard check the same thing.
+MOTION_MODULES = ('angles', 'background', 'csvout', 'depthsmooth', 'detect',
+                  'extract', 'preview', 'process_session', 'profiles',
+                  'sessiongeom', 'skeleton3d')
+
+# Subject kinds profiles.get() must answer for.
+PROFILE_KINDS = ('torso', 'hand', 'foot', 'toe_tap', 'rest_tremor', 'spine')
+
+# MDS-UPDRS test ID -> pipeline kind. Module level so /upload and the admin
+# listing agree, and so a stored recording can be labelled with the test it was
+# actually recorded for.
+TEST_TO_KIND = {
+    '3.4a': 'hand',  '3.4b': 'hand',
+    '3.5a': 'hand',  '3.5b': 'hand',
+    '3.6a': 'hand',  '3.6b': 'hand',
+    # 3.7 (Toe Tapping): lower-leg-only profile, 13-frame pixel smoothing.
+    # 3.8 (Leg Agility): full-body foot profile for wider context.
+    '3.7a': 'toe_tap', '3.7b': 'toe_tap',
+    '3.8a': 'foot',    '3.8b': 'foot',
+    '3.9':  'torso', '3.10': 'torso', '3.11': 'torso',
+    '3.12': 'torso', '3.13': 'spine',
+    '3.15a': 'hand', '3.15b': 'hand',
+    '3.16a': 'hand', '3.16b': 'hand',
+    # 3.17 (Rest Tremor): all four limbs in one recording, 3-frame pixel smoothing.
+    '3.17': 'rest_tremor',
+}
+
+TEST_LABELS = {
+    '3.4a': 'Finger Tapping – Right Hand',
+    '3.4b': 'Finger Tapping – Left Hand',
+    '3.5a': 'Hand Movements – Right Hand',
+    '3.5b': 'Hand Movements – Left Hand',
+    '3.6a': 'Pronation-Supination – Right Hand',
+    '3.6b': 'Pronation-Supination – Left Hand',
+    '3.7a': 'Toe Tapping – Right Foot',
+    '3.7b': 'Toe Tapping – Left Foot',
+    '3.8a': 'Leg Agility – Right Leg',
+    '3.8b': 'Leg Agility – Left Leg',
+    '3.9':  'Arising from Chair',
+    '3.10': 'Gait',
+    '3.11': 'Freezing of Gait',
+    '3.12': 'Postural Stability',
+    '3.13': 'Posture',
+    '3.15a': 'Postural Tremor – Right Hand',
+    '3.15b': 'Postural Tremor – Left Hand',
+    '3.16a': 'Kinetic Tremor – Right Hand',
+    '3.16b': 'Kinetic Tremor – Left Hand',
+    '3.17': 'Rest Tremor – All Limbs',
+}
+
+
+def _slug(text):
+    """Filename-safe, mirroring motion-analysis/csvout.safe().
+
+    Deliberately duplicated rather than imported: putting MOTION_DIR on the web
+    worker's sys.path would also expose extract/detect/angles/profiles, whose
+    names are generic enough to shadow something else. csvout is the authority
+    for how output is named — this is a copy of one small function, and the two
+    must be changed together.
+    """
+    s = str(text).strip()
+    s = re.sub(r'[‒-―]', ' ', s)      # figure/en/em dashes
+    s = re.sub(r'\s+', '_', s)
+    s = re.sub(r'[^\w.\-]', '', s)
+    s = re.sub(r'_{2,}', '_', s).strip('_')
+    return s or 'unnamed'
+
+
+def _output_names(test_id):
+    """Download names for a job: (zip, skeleton, rgb, depth).
+
+    Built from the dropdown choice so a folder of downloads is self-describing —
+    `3.7a_Toe_Tapping_Right_Foot.zip` rather than twenty files all called
+    `gait_coordinates.zip`.
+    """
+    label = TEST_LABELS.get(test_id or '', '')
+    base = _slug(f'{test_id} {label}') if test_id else 'results'
+    return (f'{base}.zip', f'{base}_skeleton.mp4',
+            f'{base}_rgb.mp4', f'{base}_lidar.mp4')
+
+
+# /home persists across restarts on Azure App Service; everything else is ephemeral.
+UPLOADS_DIR = '/home/uploads'
+OUTPUTS_DIR = '/home/outputs'
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+os.makedirs(OUTPUTS_DIR, exist_ok=True)
+
+# Set ADMIN_TOKEN as an Azure App Setting to enable the /admin/uploads page.
+# Leave unset to disable admin access entirely.
+ADMIN_TOKEN = os.environ.get('ADMIN_TOKEN', '')
 
 _jobs: dict = {}
 _lock = threading.Lock()
@@ -168,7 +271,7 @@ HTML = r"""<!doctype html>
   }
   .pmeta .pct { font-variant-numeric: tabular-nums; flex: none; }
 
-  /* Inline player */
+  /* Inline player — camera, LiDAR and skeleton side by side */
   .player { display: none; margin-top: 1rem; }
   .player.vis { display: block; }
   .player-h {
@@ -177,6 +280,27 @@ HTML = r"""<!doctype html>
   .player video {
     width: 100%; display: block; border-radius: var(--r);
     border: 1px solid var(--border); background: #000;
+  }
+  /* auto-fit rather than a fixed 3 columns: a panel that is missing (an older
+     job with no previews) closes the gap instead of leaving a hole, and the
+     row reflows to stacked on a narrow screen without a breakpoint. */
+  .vgrid {
+    display: grid; gap: .6rem;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    align-items: start;
+  }
+  .vcell { min-width: 0; }
+  .vcell .cap {
+    font-size: .7rem; color: var(--muted); margin-bottom: .25rem;
+    text-align: center; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* The skeleton panel is twice as wide as the two camera panels (it holds two
+     views), so let it take two columns when there is room. */
+  .vcell.wide { grid-column: span 2; }
+  @media (max-width: 560px) { .vcell.wide { grid-column: span 1; } }
+  .sync-note {
+    font-size: .7rem; color: var(--muted); margin-top: .45rem; text-align: center;
   }
 
   /* Download */
@@ -202,6 +326,36 @@ HTML = r"""<!doctype html>
     font-size: .85em; background: rgba(255,255,255,.06);
     padding: .1em .3em; border-radius: 3px;
   }
+
+  /* MDS-UPDRS test dropdown */
+  .test-select {
+    width: 100%; padding: .65rem .875rem; margin-bottom: .5rem;
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--border); border-radius: var(--r);
+    font-size: .875rem; cursor: pointer;
+    -webkit-appearance: none; -moz-appearance: none; appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%238b949e' d='M0 0l5 6 5-6z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right .875rem center;
+  }
+  .test-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(56,139,253,.15); }
+  .test-select option, .test-select optgroup { background: var(--surface); color: var(--text); }
+  .test-desc {
+    padding: .5rem .875rem .65rem; margin-bottom: 1.125rem;
+    border-radius: var(--r); border: 1px solid var(--border);
+    background: rgba(255,255,255,.02);
+    font-size: .78rem; color: var(--muted); line-height: 1.55;
+    display: none;
+  }
+  .test-desc.vis { display: block; }
+  .kind-badge {
+    display: inline-block; font-size: .7rem; font-weight: 600;
+    padding: .1rem .4rem; border-radius: 3px; margin-bottom: .35rem;
+    letter-spacing: .04em; text-transform: uppercase;
+  }
+  .badge-hand  { background: rgba(139,148,158,.15); color: var(--muted); }
+  .badge-torso { background: rgba(56,139,253,.15);  color: var(--accent); }
+  .badge-foot  { background: rgba(63,185,80,.15);   color: var(--success); }
+  .badge-spine { background: rgba(210,120,20,.15);  color: #d27814; }
 </style>
 </head>
 <body>
@@ -219,25 +373,38 @@ HTML = r"""<!doctype html>
     <input type="file" id="file" accept=".zip" style="display:none">
   </div>
 
-  <!-- Subject: torso or hand -->
-  <div class="opt-label">Subject</div>
-  <div class="tracker-row" id="subject-row">
-    <label class="t-opt selected">
-      <input type="radio" name="subject" value="auto" checked>
-      <div class="t-name">Auto-detect</div>
-      <div class="t-desc">Decides from the recording</div>
-    </label>
-    <label class="t-opt">
-      <input type="radio" name="subject" value="torso">
-      <div class="t-name">Torso</div>
-      <div class="t-desc">Walking · 12 joints</div>
-    </label>
-    <label class="t-opt">
-      <input type="radio" name="subject" value="hand">
-      <div class="t-name">Hand</div>
-      <div class="t-desc">Close-up · 21 joints</div>
-    </label>
-  </div>
+  <!-- MDS-UPDRS Part 3 test selector -->
+  <div class="opt-label">MDS-UPDRS Part 3 Test</div>
+  <select class="test-select" id="test-select">
+    <option value="" disabled selected>— Select a test —</option>
+    <optgroup label="Upper Extremity – Hand Close-Up">
+      <option value="3.4a"  data-kind="hand">3.4a · Finger Tapping – Right Hand</option>
+      <option value="3.4b"  data-kind="hand">3.4b · Finger Tapping – Left Hand</option>
+      <option value="3.5a"  data-kind="hand">3.5a · Hand Movements – Right Hand</option>
+      <option value="3.5b"  data-kind="hand">3.5b · Hand Movements – Left Hand</option>
+      <option value="3.6a"  data-kind="hand">3.6a · Pronation-Supination – Right Hand</option>
+      <option value="3.6b"  data-kind="hand">3.6b · Pronation-Supination – Left Hand</option>
+      <option value="3.15a" data-kind="hand">3.15a · Postural Tremor – Right Hand</option>
+      <option value="3.15b" data-kind="hand">3.15b · Postural Tremor – Left Hand</option>
+      <option value="3.16a" data-kind="hand">3.16a · Kinetic Tremor – Right Hand</option>
+      <option value="3.16b" data-kind="hand">3.16b · Kinetic Tremor – Left Hand</option>
+    </optgroup>
+    <optgroup label="Lower Extremity – Full Body">
+      <option value="3.7a"  data-kind="foot">3.7a · Toe Tapping – Right Foot</option>
+      <option value="3.7b"  data-kind="foot">3.7b · Toe Tapping – Left Foot</option>
+      <option value="3.8a"  data-kind="foot">3.8a · Leg Agility – Right Leg</option>
+      <option value="3.8b"  data-kind="foot">3.8b · Leg Agility – Left Leg</option>
+    </optgroup>
+    <optgroup label="Whole Body – Full Body">
+      <option value="3.9"   data-kind="torso">3.9 · Arising from Chair</option>
+      <option value="3.10"  data-kind="torso">3.10 · Gait</option>
+      <option value="3.11"  data-kind="torso">3.11 · Freezing of Gait</option>
+      <option value="3.12"  data-kind="torso">3.12 · Postural Stability</option>
+      <option value="3.13"  data-kind="spine">3.13 · Posture</option>
+      <option value="3.17"  data-kind="rest_tremor">3.17 · Rest Tremor – All Limbs</option>
+    </optgroup>
+  </select>
+  <div class="test-desc" id="test-desc"></div>
 
   <!-- Tracker choice (torso only) -->
   <div class="opt-label" id="tracker-label">Tracker</div>
@@ -254,7 +421,7 @@ HTML = r"""<!doctype html>
     </label>
   </div>
 
-  <button class="btn-primary" id="go" disabled>Analyze Gait</button>
+  <button class="btn-primary" id="go" disabled>Analyze</button>
 
   <div class="status" id="st">
     <span class="spin" id="spin"></span><span id="stmsg"></span>
@@ -264,8 +431,22 @@ HTML = r"""<!doctype html>
     </div>
   </div>
   <div class="player" id="player">
-    <div class="player-h">3D skeleton &mdash; three-quarter and side view</div>
-    <video id="vid" controls autoplay loop muted playsinline preload="auto"></video>
+    <div class="player-h">Camera, LiDAR and tracker &mdash; same frames, same orientation</div>
+    <div class="vgrid">
+      <div class="vcell" id="cell-rgb">
+        <div class="cap">Camera (RGB)</div>
+        <video id="vid-rgb" loop muted playsinline preload="auto"></video>
+      </div>
+      <div class="vcell" id="cell-depth">
+        <div class="cap">LiDAR depth &mdash; near blue, far red</div>
+        <video id="vid-depth" loop muted playsinline preload="auto"></video>
+      </div>
+      <div class="vcell wide" id="cell-skel">
+        <div class="cap">3D skeleton &mdash; front and side view</div>
+        <video id="vid" controls autoplay loop muted playsinline preload="auto"></video>
+      </div>
+    </div>
+    <div class="sync-note">Use the controls on the skeleton &mdash; all three play together.</div>
   </div>
 
   <a class="dl-btn" id="mdl" download>&#8595; Download 3D Movie (MP4)</a>
@@ -277,11 +458,23 @@ HTML = r"""<!doctype html>
     <em>Compress</em> to create a ZIP. The folder must contain
     <code>rgb.mp4</code>, <code>camera_matrix.csv</code>,
     and the <code>depth/</code> &amp; <code>confidence/</code> frame folders.<br><br>
-    <b>Output:</b> One CSV per joint (ankle, knee, hip, shoulder, elbow, wrist — left &amp; right)
-    with X&nbsp;Y&nbsp;Z coordinates per frame, angle CSVs for knees, hips and elbows,
-    and a <b>3D stick figure movie</b> animating the joints with bones drawn between
-    them — shown as a three-quarter view alongside a side view rotated 90&deg;.
-    All axes are distances from the camera, so the figure moves through space.<br><br>
+    <b>Select the MDS-UPDRS Part 3 test</b> that matches your recording.
+    <em>Upper extremity</em> tests (finger tapping, hand movements, pronation-supination,
+    postural/kinetic tremor) use a hand close-up and track 21 finger joints.
+    <em>Lower extremity and whole-body</em> tests (gait, arising from chair, toe tapping, leg
+    agility, postural stability, posture) use a full-body view and track 12 joints
+    (shoulders through ankles).
+    <em>Rest tremor (3.17)</em> uses the same full-body view — one recording covers all four
+    limbs simultaneously; score each limb from its wrist or ankle CSV.<br><br>
+    <b>Output:</b> One CSV per joint with X&nbsp;Y&nbsp;Z coordinates per frame,
+    angle CSVs for each measured joint pair, and three movies — the
+    <b>camera</b>, the <b>LiDAR depth</b>, and a <b>3D stick figure</b> with bones
+    drawn between the joints. Every file is named for the test you chose
+    (<code>3.7a_left_knee.csv</code>), and every column carries its unit in the
+    header row — <code>time_s,x_m,y_m,z_m</code> for a joint's position and
+    <code>time_s,angle_deg</code> for an angle, so every row is stamped with the
+    second it was captured. All axes are real-world distances from the
+    camera.<br><br>
     <b>Note:</b> Processing takes 5&nbsp;–&nbsp;15&nbsp;minutes depending on video length.
     Keep this tab open while it runs.
   </div>
@@ -303,6 +496,31 @@ const dl   = document.getElementById('dl');
 const mdl  = document.getElementById('mdl');
 const player = document.getElementById('player');
 const vid  = document.getElementById('vid');
+const vidRgb = document.getElementById('vid-rgb');
+const vidDepth = document.getElementById('vid-depth');
+const cellRgb = document.getElementById('cell-rgb');
+const cellDepth = document.getElementById('cell-depth');
+
+// The skeleton is the only panel with visible controls; the other two follow it.
+// Guarded by `syncing` because assigning currentTime fires another seek event,
+// and without the guard the three videos chase each other indefinitely.
+let syncing = false;
+function followers() {
+  return [vidRgb, vidDepth].filter(v => v.getAttribute('src'));
+}
+function mirror(fn) {
+  if (syncing) return;
+  syncing = true;
+  try { followers().forEach(fn); } finally { syncing = false; }
+}
+vid.addEventListener('play',  () => mirror(v => v.play().catch(() => {})));
+vid.addEventListener('pause', () => mirror(v => v.pause()));
+vid.addEventListener('seeking', () => mirror(v => { v.currentTime = vid.currentTime; }));
+// Drift correction: the three decoders do not advance in lockstep, so nudge any
+// follower that has slipped more than ~2 frames at 60fps.
+vid.addEventListener('timeupdate', () => mirror(v => {
+  if (Math.abs(v.currentTime - vid.currentTime) > 0.04) v.currentTime = vid.currentTime;
+}));
 
 let chosen = null;
 
@@ -320,35 +538,86 @@ function pick(f) {
   chosen = f;
   fname.textContent = f.name + '  (' + (f.size / 1048576).toFixed(1) + ' MB)';
   drop.classList.add('has-file');
-  go.disabled = false;
+  syncTracker();
   reset();
 }
 
 document.querySelectorAll('.t-opt').forEach(o => o.addEventListener('click', () => {
-  // selection is per row, so the subject and tracker groups stay independent
   const row = o.closest('.tracker-row');
   row.querySelectorAll('.t-opt').forEach(x => x.classList.remove('selected'));
   o.classList.add('selected');
-  syncTracker();
 }));
 
-// RTMPose only exists for the torso pipeline, so hide the choice for a hand.
+const testSelect = document.getElementById('test-select');
+const testDesc   = document.getElementById('test-desc');
+
+const TEST_META = {
+  '3.4a':  {kind:'hand',  desc:'Tap index finger to thumb as fast as possible for ~10 sec. Records speed, amplitude, and rhythm decay of each tap.'},
+  '3.4b':  {kind:'hand',  desc:'Tap index finger to thumb as fast as possible for ~10 sec. Records speed, amplitude, and rhythm decay of each tap.'},
+  '3.5a':  {kind:'hand',  desc:'Open and close the fist fully as fast as possible for ~10 sec. Records amplitude and speed of hand opening.'},
+  '3.5b':  {kind:'hand',  desc:'Open and close the fist fully as fast as possible for ~10 sec. Records amplitude and speed of hand opening.'},
+  '3.6a':  {kind:'hand',  desc:'Rapidly alternate palm-up and palm-down for ~10 sec. Records rotational speed and regularity.'},
+  '3.6b':  {kind:'hand',  desc:'Rapidly alternate palm-up and palm-down for ~10 sec. Records rotational speed and regularity.'},
+  '3.7a':  {kind:'foot',  desc:'While seated, tap the right toe up and down repeatedly for ~10 sec. Records cadence, lift amplitude (ankle dorsiflexion), and hesitations.'},
+  '3.7b':  {kind:'foot',  desc:'While seated, tap the left toe up and down repeatedly for ~10 sec. Records cadence, lift amplitude (ankle dorsiflexion), and hesitations.'},
+  '3.8a':  {kind:'foot',  desc:'While seated, stamp the right foot rapidly for ~10 sec. Records lift height, speed, and regularity. Tracks heel and toe separately.'},
+  '3.8b':  {kind:'foot',  desc:'While seated, stamp the left foot rapidly for ~10 sec. Records lift height, speed, and regularity. Tracks heel and toe separately.'},
+  '3.9':   {kind:'torso', desc:'Rise from an armless chair with arms crossed over the chest. Records trunk lean, rise speed, and balance on completion.'},
+  '3.10':  {kind:'torso', desc:'Walk ~10 m, turn, and return. Records step length, cadence, arm swing, and trunk posture throughout.'},
+  '3.11':  {kind:'torso', desc:'Walk through a doorway and turn twice. Detects hesitation, shuffling, and freezing episodes.'},
+  '3.12':  {kind:'torso', desc:'Stand and recover from an unexpected backward pull on the shoulders. Records trunk displacement and recovery time.'},
+  '3.13':  {kind:'spine', desc:'Stand naturally with eyes open. Records vertebral-level angles (lumbar through cervical) using the SpinePose 37-keypoint model to quantify stooped posture.'},
+  '3.15a': {kind:'hand',  desc:'Hold the right arm outstretched and still for ~10 sec. Records involuntary oscillation amplitude and frequency.'},
+  '3.15b': {kind:'hand',  desc:'Hold the left arm outstretched and still for ~10 sec. Records involuntary oscillation amplitude and frequency.'},
+  '3.16a': {kind:'hand',  desc:'Move the right index finger repeatedly from your nose to a fixed target. Records tremor amplitude during intentional movement.'},
+  '3.16b': {kind:'hand',  desc:'Move the left index finger repeatedly from your nose to a fixed target. Records tremor amplitude during intentional movement.'},
+  '3.17':  {kind:'rest_tremor', desc:'Sit quietly with hands placed on the chair arms and feet flat on the floor for 10 sec. Records wrist and ankle positions from all four limbs simultaneously — use the output CSVs to score RUE, LUE, RLE, and LLE rest tremor separately.'},
+};
+
+testSelect.addEventListener('change', syncTracker);
+
+// RTMPose only exists for the torso pipeline, so grey it out for hand tests.
 function syncTracker() {
-  const subj = document.querySelector('input[name="subject"]:checked').value;
-  const row = document.getElementById('tracker-row');
-  const lbl = document.getElementById('tracker-label');
-  const off = (subj === 'hand');
-  row.classList.toggle('disabled', off);
-  lbl.textContent = off ? 'Tracker (torso only)' : 'Tracker';
-  document.getElementById('go').textContent =
-    subj === 'hand' ? 'Analyze Hand' : (subj === 'torso' ? 'Analyze Gait' : 'Analyze');
+  const val  = testSelect.value;
+  const meta = TEST_META[val];
+  const opt  = testSelect.options[testSelect.selectedIndex];
+  const kind = (opt && opt.dataset) ? opt.dataset.kind : '';
+
+  if (meta) {
+    const badge = kind === 'hand'
+      ? '<span class="kind-badge badge-hand">Hand close-up · 21 joints</span>'
+      : kind === 'foot'
+      ? '<span class="kind-badge badge-foot">Full body · 18 joints (feet)</span>'
+      : kind === 'spine'
+      ? '<span class="kind-badge badge-spine">Spine · 6 vertebral angles</span>'
+      : kind === 'rest_tremor'
+      ? '<span class="kind-badge badge-torso">Full body · 12 joints · 3-frame smoothing</span>'
+      : '<span class="kind-badge badge-torso">Full body · 12 joints</span>';
+    testDesc.innerHTML = badge + '<br>' + meta.desc;
+    testDesc.className = 'test-desc vis';
+  } else {
+    testDesc.className = 'test-desc';
+  }
+
+  const trackerRow = document.getElementById('tracker-row');
+  const trackerLbl = document.getElementById('tracker-label');
+  const off = (kind === 'hand' || kind === 'foot' || kind === 'spine' || kind === 'rest_tremor');
+  trackerRow.classList.toggle('disabled', off);
+  trackerLbl.textContent = kind === 'hand'        ? 'Tracker (torso only)'
+                         : kind === 'foot'        ? 'Tracker (WholeBody, fixed)'
+                         : kind === 'spine'       ? 'Tracker (SpinePose, fixed)'
+                         : kind === 'rest_tremor' ? 'Tracker (MediaPipe, fixed)'
+                         : 'Tracker';
+
+  go.disabled = !(chosen && val);
 }
 syncTracker();
 
 go.addEventListener('click', async () => {
-  if (!chosen) return;
-  const tracker = document.querySelector('input[name="tracker"]:checked').value;
-  const subject = document.querySelector('input[name="subject"]:checked').value;
+  if (!chosen || !testSelect.value) return;
+  const tracker  = document.querySelector('input[name="tracker"]:checked').value;
+  const test     = testSelect.value;
+  const testName = testSelect.options[testSelect.selectedIndex].text.split('·').slice(1).join('·').trim();
   go.disabled = true;
   setStatus('proc', 'Uploading…');
   dl.className = 'dl-btn';
@@ -356,7 +625,7 @@ go.addEventListener('click', async () => {
   const form = new FormData();
   form.append('session', chosen);
   form.append('tracker', tracker);
-  form.append('subject', subject);
+  form.append('test', test);
 
   let jobId;
   try {
@@ -366,7 +635,7 @@ go.addEventListener('click', async () => {
     jobId = d.job_id;
   } catch (e) { return fail(e.message); }
 
-  setStatus('proc', 'Analyzing gait…');
+  setStatus('proc', 'Analyzing ' + testName + '…');
   pwrap.className = 'pwrap vis';
   setProgress(0, 'Starting…');
   const started = Date.now();
@@ -391,6 +660,16 @@ go.addEventListener('click', async () => {
           // ?download=1 makes the server send the same file as an attachment
           mdl.href = '/movie/' + jobId + '?download=1';
           mdl.className = 'dl-btn vis';
+          // Camera and LiDAR are best-effort: a session the previews failed on
+          // still shows its skeleton rather than an empty row.
+          if (d.has_rgb) { vidRgb.src = '/media/' + jobId + '/rgb'; }
+          if (d.has_depth) { vidDepth.src = '/media/' + jobId + '/depth'; }
+          cellRgb.style.display = d.has_rgb ? '' : 'none';
+          cellDepth.style.display = d.has_depth ? '' : 'none';
+          // With only the skeleton present there is nothing to sit beside, so
+          // let it use the full width instead of two of three columns.
+          document.getElementById('cell-skel').className =
+            (d.has_rgb || d.has_depth) ? 'vcell wide' : 'vcell';
         }
         go.disabled = false;
       } else if (d.status === 'error') {
@@ -442,12 +721,14 @@ function reset() {
   dl.className = 'dl-btn';
   mdl.className = 'dl-btn';
   pwrap.className = 'pwrap';
-  // Stop and unload the previous run's video, otherwise it keeps playing
+  // Stop and unload the previous run's videos, otherwise they keep playing
   // underneath while the next upload is processing
   player.className = 'player';
-  vid.pause();
-  vid.removeAttribute('src');
-  vid.load();
+  [vid, vidRgb, vidDepth].forEach(v => {
+    v.pause();
+    v.removeAttribute('src');
+    v.load();
+  });
 }
 </script>
 </body>
@@ -471,9 +752,9 @@ def healthz():
     and so it exercises the same interpreter the pipeline itself uses.
     """
     probe = (
-        'import json, sys; out = {}\n'
+        'import json, os, sys; out = {}\n'
         'for mod in ("numpy", "cv2", "mediapipe", "pandas", "matplotlib",\n'
-        '            "onnxruntime", "rtmlib"):\n'
+        '            "onnxruntime", "rtmlib", "imageio_ffmpeg"):\n'
         '    try:\n'
         '        m = __import__(mod)\n'
         '        out[mod] = {"ok": True, "version": getattr(m, "__version__", "?"),\n'
@@ -484,6 +765,46 @@ def healthz():
         '    import mediapipe as mp; out["mp.solutions"] = {"ok": hasattr(mp, "solutions")}\n'
         'except Exception as e:\n'
         '    out["mp.solutions"] = {"ok": False, "error": str(e)}\n'
+        'try:\n'
+        '    from rtmlib import Wholebody; out["rtmlib.Wholebody"] = {"ok": True}\n'
+        'except Exception as e:\n'
+        '    out["rtmlib.Wholebody"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
+        'try:\n'
+        '    from spinepose import PoseTracker as SpinePT, SpinePoseEstimator; out["spinepose"] = {"ok": True}\n'
+        'except Exception as e:\n'
+        '    out["spinepose"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
+        f'md = {repr(MOTION_DIR)}\n'
+        'sys.path.insert(0, md)\n'
+        # File presence first: a partial deploy is reported as the missing file
+        # it is, rather than as whatever transitive import happens to fail.
+        f'expected = {repr(list(MOTION_MODULES))}\n'
+        'present = sorted(f[:-3] for f in os.listdir(md) if f.endswith(".py")) if os.path.isdir(md) else []\n'
+        'missing = [m for m in expected if m not in present]\n'
+        'out["motion.files"] = {"ok": not missing, "dir": md,\n'
+        '                       "expected": len(expected), "present": len(present),\n'
+        '                       "missing": missing}\n'
+        # Then import every pipeline module, not just the ones that happen to be
+        # reachable from extract. skeleton3d in particular is only used at the
+        # final render step, so an import-time check is the only cheap way to
+        # catch it before a full tracking pass has already been spent.
+        'for mod in expected:\n'
+        '    try:\n'
+        '        __import__(mod)\n'
+        '        out["motion." + mod] = {"ok": True}\n'
+        '    except Exception as e:\n'
+        '        out["motion." + mod] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
+        # Every kind the upload form can dispatch to, so a profile that raises
+        # for one subject cannot hide behind the others.
+        f'kinds = {repr(list(PROFILE_KINDS))}\n'
+        'for k in kinds:\n'
+        '    try:\n'
+        '        import profiles; p = profiles.get(k)\n'
+        '        out["profiles." + k] = {"ok": True, "model": p["model"],\n'
+        '                                "pixel_win": p.get("pixel_smooth_window")}\n'
+        '    except Exception as e:\n'
+        '        out["profiles." + k] = {"ok": False, "error": f"{type(e).__name__}: {e}"}\n'
+        # Single verdict so a deploy can be checked without reading every key.
+        'out["ok"] = all(v.get("ok") for v in out.values() if isinstance(v, dict))\n'
         'print(json.dumps(out))\n'
     )
     proc = subprocess.run(
@@ -491,7 +812,62 @@ def healthz():
     )
     if proc.returncode != 0:
         return jsonify(ok=False, stderr=(proc.stderr or '')[-3000:]), 500
-    return app.response_class(proc.stdout, mimetype='application/json')
+    # 503 on any failed check so a deploy can be gated on the status code alone.
+    # Safe to fail loudly here: healthCheckPath is unset and the platform warmup
+    # probe hits '/', so a red /healthz cannot stop the container from starting.
+    try:
+        code = 200 if json.loads(proc.stdout).get('ok') else 503
+    except (ValueError, AttributeError):
+        code = 500
+    return app.response_class(proc.stdout, mimetype='application/json', status=code)
+
+
+def _meta_path(save_path):
+    return save_path + '.meta.json'
+
+
+def _write_upload_meta(save_path, job_id, test_id, kind, original_name, size):
+    """Store the test an upload was recorded for, as a sidecar next to the zip."""
+    meta = {
+        'job_id': job_id,
+        'test': test_id or None,
+        'test_label': TEST_LABELS.get(test_id),
+        'kind': kind,
+        'original_name': original_name,
+        'size': size,
+        'uploaded_utc': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+        'status': 'processing',
+    }
+    try:
+        with open(_meta_path(save_path), 'w', encoding='utf-8') as fh:
+            json.dump(meta, fh, indent=2)
+    except OSError:
+        pass  # non-fatal — never fail an upload over bookkeeping
+
+
+def _update_upload_meta(save_path, **fields):
+    """Patch an existing sidecar; silently no-op if it was never written."""
+    path = _meta_path(save_path)
+    try:
+        with open(path, encoding='utf-8') as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError):
+        return
+    meta.update(fields)
+    try:
+        with open(path, 'w', encoding='utf-8') as fh:
+            json.dump(meta, fh, indent=2)
+    except OSError:
+        pass
+
+
+def _read_upload_meta(name):
+    """Sidecar for an uploads/ filename, or {} if there is none."""
+    try:
+        with open(os.path.join(UPLOADS_DIR, name + '.meta.json'), encoding='utf-8') as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
 
 
 @app.route('/upload', methods=['POST'])
@@ -504,20 +880,44 @@ def upload():
     if tracker not in ('mediapipe', 'rtmpose'):
         tracker = 'mediapipe'
 
-    # 'auto' lets motion-analysis decide from the recording; lower-body
-    # visibility separates a walking subject from a hand close-up cleanly.
-    subject = request.form.get('subject', 'auto')
-    if subject not in ('auto', 'torso', 'hand'):
-        subject = 'auto'
+    # Map the MDS-UPDRS test ID to the pipeline kind (torso/hand).
+    # The old 'subject' field is kept as a fallback for direct API callers.
+    test_id = request.form.get('test', '')
+    if test_id in TEST_TO_KIND:
+        subject = TEST_TO_KIND[test_id]
+    else:
+        subject = request.form.get('subject', 'auto')
+        if subject not in ('auto', 'torso', 'hand'):
+            subject = 'auto'
 
     job_id = str(uuid.uuid4())
     zip_bytes = f.read()
+
+    # Persist the raw upload so it can be retrieved later via /admin/uploads.
+    safe_name = re.sub(r'[^\w\-.]', '_', f.filename or 'upload')[:80]
+    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    save_path = os.path.join(UPLOADS_DIR, f"{ts}_{job_id[:8]}_{safe_name}")
+    try:
+        with open(save_path, 'wb') as fh:
+            fh.write(zip_bytes)
+    except OSError:
+        pass  # non-fatal; processing continues even if the save fails
+
+    # Record WHICH test this recording was for, next to the recording itself.
+    # Without this a stored upload cannot be matched back to its MDS-UPDRS item:
+    # the five recordings stranded by a failed batch on 2026-09-24 could only be
+    # re-run by guessing, because nothing tied them to a test. A sidecar .json
+    # keeps older uploads valid — they simply have no metadata.
+    _write_upload_meta(save_path, job_id, test_id, subject, f.filename, len(zip_bytes))
 
     with _lock:
         _jobs[job_id] = {'status': 'processing', 'result': None, 'error': None,
                          'percent': 0, 'stage': 'Queued…'}
 
-    threading.Thread(target=_run_job, args=(job_id, zip_bytes, tracker, subject), daemon=True).start()
+    threading.Thread(target=_run_job,
+                     args=(job_id, zip_bytes, tracker, subject, save_path,
+                           test_id),
+                     daemon=True).start()
     return jsonify(job_id=job_id)
 
 
@@ -529,7 +929,9 @@ def status(job_id):
         return jsonify(error='unknown job'), 404
     return jsonify(status=job['status'], error=job.get('error'),
                    percent=job.get('percent', 0), stage=job.get('stage', ''),
-                   has_movie=bool(job.get('movie')))
+                   has_movie=bool(job.get('movie')),
+                   has_rgb=bool(job.get('rgb')),
+                   has_depth=bool(job.get('depth')))
 
 
 @app.route('/download/<job_id>')
@@ -541,7 +943,7 @@ def download(job_id):
     return send_file(
         io.BytesIO(job['result']),
         as_attachment=True,
-        download_name='gait_coordinates.zip',
+        download_name=job.get('zip_name') or 'gait_coordinates.zip',
         mimetype='application/zip',
     )
 
@@ -562,18 +964,199 @@ def movie(job_id):
     return send_file(
         io.BytesIO(job['movie']),
         mimetype='video/mp4',
-        download_name=MOVIE_NAME,
+        download_name=job.get('movie_name') or MOVIE_NAME,
+        as_attachment=request.args.get('download') == '1',
+        conditional=True,
+    )
+
+
+@app.route('/media/<job_id>/<which>')
+def media(job_id, which):
+    """The raw camera ('rgb') or raw LiDAR ('depth') movie for a finished job.
+
+    Separate from /movie because these two are best-effort: a session whose
+    previews failed still returns its skeleton, and the page simply hides the
+    panels it cannot fill.
+    """
+    if which not in ('rgb', 'depth'):
+        return jsonify(error='unknown media'), 404
+    with _lock:
+        job = dict(_jobs.get(job_id, {}))
+    if not job or job.get('status') != 'done' or not job.get(which):
+        return jsonify(error=f'{which} not available'), 400
+    return send_file(
+        io.BytesIO(job[which]),
+        mimetype='video/mp4',
+        download_name=job.get(f'{which}_name') or f'{which}.mp4',
         as_attachment=request.args.get('download') == '1',
         conditional=True,
     )
 
 
 # ---------------------------------------------------------------------------
+# Admin — upload retrieval
+# ---------------------------------------------------------------------------
+
+def _check_admin(req):
+    """Return None if the request is authorised, or a (message, status) tuple."""
+    if not ADMIN_TOKEN:
+        return ('ADMIN_TOKEN app setting is not configured on this server.', 403)
+    if req.args.get('token') != ADMIN_TOKEN:
+        return ('Invalid or missing token. Append ?token=<ADMIN_TOKEN> to the URL.', 401)
+    return None
+
+
+@app.route('/admin/uploads')
+def admin_uploads():
+    err = _check_admin(request)
+    if err:
+        return err
+
+    entries = []
+    for name in os.listdir(UPLOADS_DIR):
+        path = os.path.join(UPLOADS_DIR, name)
+        # Sidecars describe the recording next to them; they are not uploads.
+        if not os.path.isfile(path) or name.endswith('.meta.json'):
+            continue
+        size_kb = os.path.getsize(path) // 1024
+        mtime = datetime.utcfromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M UTC')
+        entries.append((name, size_kb, mtime, _read_upload_meta(name)))
+    entries.sort(key=lambda e: e[2], reverse=True)
+
+    token = request.args['token']
+
+    def _cells(name, size_kb, mtime, meta):
+        # Uploads predating the sidecar have no test recorded, and it cannot be
+        # recovered after the fact — say so rather than implying 'none'.
+        test = meta.get('test')
+        label = meta.get('test_label') or ''
+        test_cell = f'{test} · {label}' if test else '<i>not recorded</i>'
+        kind = meta.get('kind') or '—'
+        status = meta.get('status') or '<i>unknown</i>'
+        colour = {'done': '#0a0', 'error': '#c00'}.get(meta.get('status'), '#888')
+        err = meta.get('error')
+        if err:
+            status += f'<br><span style="font-size:11px">{err[:120]}</span>'
+        return (f'<tr><td style="padding:4px 12px">{name}</td>'
+                f'<td style="padding:4px 12px">{test_cell}</td>'
+                f'<td style="padding:4px 12px">{kind}</td>'
+                f'<td style="padding:4px 12px;color:{colour}">{status}</td>'
+                f'<td style="padding:4px 12px">{size_kb} KB</td>'
+                f'<td style="padding:4px 12px">{mtime}</td>'
+                f'<td style="padding:4px 12px">'
+                f'<a href="/admin/download/{name}?token={token}">download</a></td></tr>')
+
+    rows = ''.join(_cells(*e) for e in entries)
+    n_failed = sum(1 for e in entries if e[3].get('status') == 'error')
+    banner = (f'<p style="color:#c00">{n_failed} upload(s) recorded as failed.</p>'
+              if n_failed else '')
+    html = (
+        '<html><body style="font-family:monospace">'
+        f'<h3>Saved uploads ({len(entries)} files)</h3>'
+        + banner +
+        '<table border="1" cellspacing="0"><tr>'
+        '<th style="padding:4px 12px">File</th>'
+        '<th style="padding:4px 12px">Test</th>'
+        '<th style="padding:4px 12px">Kind</th>'
+        '<th style="padding:4px 12px">Result</th>'
+        '<th style="padding:4px 12px">Size</th>'
+        '<th style="padding:4px 12px">Uploaded</th>'
+        '<th></th></tr>'
+        + rows +
+        '</table></body></html>'
+    )
+    return html
+
+
+@app.route('/admin/outputs')
+def admin_outputs():
+    err = _check_admin(request)
+    if err:
+        return err
+
+    entries = []
+    for name in os.listdir(OUTPUTS_DIR):
+        path = os.path.join(OUTPUTS_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        size_kb = os.path.getsize(path) // 1024
+        mtime = datetime.utcfromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M UTC')
+        entries.append((name, size_kb, mtime))
+    entries.sort(key=lambda e: e[2], reverse=True)
+
+    token = request.args['token']
+    rows = ''.join(
+        f'<tr><td style="padding:4px 12px">{name}</td>'
+        f'<td style="padding:4px 12px">{size_kb} KB</td>'
+        f'<td style="padding:4px 12px">{mtime}</td>'
+        f'<td style="padding:4px 12px"><a href="/admin/download-output/{name}?token={token}">download</a></td></tr>'
+        for name, size_kb, mtime in entries
+    )
+    html = (
+        '<html><body style="font-family:monospace">'
+        f'<h3>Saved outputs ({len(entries)} files)</h3>'
+        '<table border="1" cellspacing="0"><tr>'
+        '<th style="padding:4px 12px">File</th>'
+        '<th style="padding:4px 12px">Size</th>'
+        '<th style="padding:4px 12px">Time</th>'
+        '<th></th></tr>'
+        + rows +
+        '</table></body></html>'
+    )
+    return html
+
+
+@app.route('/admin/download-output/<path:filename>')
+def admin_download_output(filename):
+    err = _check_admin(request)
+    if err:
+        return err
+
+    if '/' in filename or '\\' in filename or '..' in filename:
+        return ('Bad filename.', 400)
+    path = os.path.join(OUTPUTS_DIR, filename)
+    if not os.path.isfile(path):
+        return ('File not found.', 404)
+    return send_file(path, as_attachment=True, download_name=filename)
+
+
+@app.route('/admin/download/<path:filename>')
+def admin_download(filename):
+    err = _check_admin(request)
+    if err:
+        return err
+
+    # Guard against path traversal
+    if '/' in filename or '\\' in filename or '..' in filename:
+        return ('Bad filename.', 400)
+    path = os.path.join(UPLOADS_DIR, filename)
+    if not os.path.isfile(path):
+        return ('File not found.', 404)
+    return send_file(path, as_attachment=True, download_name=filename)
+
+
+# ---------------------------------------------------------------------------
 # Background processing
 # ---------------------------------------------------------------------------
 
+def _preview_src(session: str) -> str:
+    """Statements that render the camera and LiDAR movies, appended to a script.
+
+    preview.render_both swallows and reports its own failures, so this stays a
+    plain call — the surrounding scripts are '; '-joined one-liners and cannot
+    hold a try/except.
+    """
+    return '; '.join([
+        f'sys.path.insert(0, {repr(MOTION_DIR)})',
+        'import preview',
+        f'preview.render_both({repr(session)}, {repr(RGB_NAME)}, '
+        f'{repr(DEPTH_NAME)}, fps=60.0)',
+    ])
+
+
 def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
-             subject: str = 'auto') -> None:
+             subject: str = 'auto', save_path: str = '',
+             test_id: str = '') -> None:
     work = tempfile.mkdtemp(prefix='lidar_')
     try:
         # --- Extract ZIP ---
@@ -628,7 +1211,7 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
         data_rel = os.path.join('charts', session, 'data')
         cam_rel = os.path.join(session, 'camera_matrix.csv')
 
-        if kind == 'hand':
+        if kind in ('hand', 'foot', 'toe_tap', 'rest_tremor', 'spine'):
             # motion-analysis writes data/ under the folder it is given, so
             # pointing it at charts/<session> puts the CSVs exactly where the
             # bundling step below already looks for them.
@@ -638,11 +1221,13 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
                 'import matplotlib; matplotlib.use("Agg")',
                 f'sys.path.insert(0, {repr(MOTION_DIR)})',
                 'import extract, angles, profiles, skeleton3d',
-                '_p = profiles.get("hand")',
-                f'_a, _geom = extract.extract_all_landmarks({repr(session)}, kind="hand")',
+                f'_p = profiles.get({repr(kind)})',
+                f'_a, _geom = extract.extract_all_landmarks({repr(session)}, kind={repr(kind)})',
                 '_ang = angles.compute(_a, _p)',
-                f'angles.write(_a, _ang, _p, {repr(out_rel)}, fps=60.0, graphs=True)',
+                f'angles.write(_a, _ang, _p, {repr(out_rel)}, fps=60.0, '
+                f'graphs=True, test_id={repr(test_id or None)})',
                 f'skeleton3d.render(_a, _p, {repr(MOVIE_NAME)}, fps=60.0)',
+                _preview_src(session),
             ])
         else:
             script = None
@@ -659,22 +1244,27 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
             ]
         script_lines += [
             'import calculateangle',
-            f'calculateangle.main(folder={repr(session)})',
+            f'calculateangle.main(folder={repr(session)}, '
+            f'test_id={repr(test_id or None)})',
             # Then the 3D stick figure, built from the CSVs just written.
             # No intrinsics repair here: pipelandmark now derives them from the
             # session's own orientation and camera matrix, so applying
             # skeleton3d.repair_intrinsics would correct an already-correct
             # projection twice.
             'import skeleton3d',
-            f'_lm = skeleton3d.load_landmarks({repr(data_rel)})',
+            f'_lm = skeleton3d.load_landmarks({repr(data_rel)}, '
+            f'test_id={repr(test_id or None)})',
             f'skeleton3d.render_movie(_lm, {repr(MOVIE_NAME)})',
+            _preview_src(session),
         ]
         if script is None:
             script = '; '.join(script_lines)
 
         # Fail with something actionable rather than an ImportError traceback.
-        # RTMPose is a torso-only tracker, so a hand job never needs the probe.
-        if tracker == 'rtmpose' and kind != 'hand':
+        # The tracker dropdown applies only to the gait-analysis torso pipeline;
+        # hand and foot use their own fixed models (MediaPipe Hands and rtmlib
+        # Wholebody respectively), so only check rtmlib when torso+rtmpose.
+        if tracker == 'rtmpose' and kind == 'torso':
             probe = subprocess.run([sys.executable, '-c', 'import rtmlib'],
                                    capture_output=True, text=True)
             if probe.returncode != 0:
@@ -697,12 +1287,15 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
 
         tail = collections.deque(maxlen=100)
         deadline = time.monotonic() + PIPELINE_TIMEOUT
-        n_joints, cur_joint = (15 if kind == 'hand' else 6), 0
-        # Three phases share the bar: the single tracking pass over the video,
-        # the quick per-joint angle maths, then rendering the 3D movie. A fully
-        # cached session emits no @@FRAME, so the joints carry the first stretch.
+        n_joints, cur_joint = (15 if kind == 'hand' else 8 if kind == 'foot' else 6), 0
+        # Four phases share the bar: the single tracking pass over the video,
+        # the quick per-joint angle maths, rendering the 3D movie, then the two
+        # camera/LiDAR previews. A fully cached session emits no @@FRAME, so the
+        # joints carry the first stretch.
         TRACK_SHARE = 55
         ANGLE_SHARE = 60
+        RENDER_SHARE = 90
+        PREVIEW_MID = 94          # boundary between the rgb and lidar previews
         tracked = False
 
         for raw in proc.stdout:
@@ -738,9 +1331,22 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
                 try:
                     done, total = (int(v) for v in line[9:].split('/'))
                     if total:
-                        pct = ANGLE_SHARE + (98 - ANGLE_SHARE) * done / total
+                        pct = ANGLE_SHARE + (RENDER_SHARE - ANGLE_SHARE) * done / total
                         _set_progress(job_id, pct,
                                       f'Rendering 3D movie — frame {done}/{total}')
+                except ValueError:
+                    pass
+            elif line.startswith('@@PREVIEW '):
+                # Two previews share the last stretch: camera then LiDAR.
+                try:
+                    label, frac = line[10:].split(' ', 1)
+                    done, total = (int(v) for v in frac.split('/'))
+                    lo = RENDER_SHARE if label == 'rgb' else PREVIEW_MID
+                    hi = PREVIEW_MID if label == 'rgb' else 98
+                    if total:
+                        _set_progress(job_id, lo + (hi - lo) * done / total,
+                                      f'Rendering {label} movie — '
+                                      f'frame {done}/{total}')
                 except ValueError:
                     pass
 
@@ -761,11 +1367,18 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
                 'Check that the video and LiDAR frames are valid.'
             )
 
-        movie_path = os.path.join(work, MOVIE_NAME)
-        movie = None
-        if os.path.exists(movie_path):
-            with open(movie_path, 'rb') as fh:
-                movie = fh.read()
+        zip_name, skel_name, rgb_name, depth_name = _output_names(test_id)
+
+        def _read(fname):
+            path = os.path.join(work, fname)
+            if not os.path.exists(path):
+                return None
+            with open(path, 'rb') as fh:
+                return fh.read()
+
+        movie = _read(MOVIE_NAME)
+        rgb = _read(RGB_NAME)
+        depth = _read(DEPTH_NAME)
 
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -773,14 +1386,41 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
                 if name.endswith('.csv'):
                     zf.write(os.path.join(data_dir, name), name)
             # Already-compressed video: storing it avoids a pointless deflate pass
-            if movie is not None:
-                zf.writestr(MOVIE_NAME, movie, compress_type=zipfile.ZIP_STORED)
+            for blob, name in ((movie, skel_name), (rgb, rgb_name),
+                               (depth, depth_name)):
+                if blob is not None:
+                    zf.writestr(name, blob, compress_type=zipfile.ZIP_STORED)
         buf.seek(0)
+        result_bytes = buf.read()
+
+        # Persist output to /home/outputs so it can be retrieved later. The test
+        # id goes in the stored name too, so a folder of past runs can be read
+        # without opening each zip.
+        ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        out_stem = f"{ts}_{job_id[:8]}"
+        if test_id:
+            out_stem += f"_{_slug(test_id)}"
+        try:
+            with open(os.path.join(OUTPUTS_DIR, f"{out_stem}_output.zip"), 'wb') as fh:
+                fh.write(result_bytes)
+            if movie is not None:
+                with open(os.path.join(OUTPUTS_DIR, f"{out_stem}_skeleton.mp4"), 'wb') as fh:
+                    fh.write(movie)
+        except OSError:
+            pass
 
         with _lock:
-            _jobs[job_id] = {'status': 'done', 'result': buf.read(), 'error': None,
+            _jobs[job_id] = {'status': 'done', 'result': result_bytes, 'error': None,
                              'percent': 100, 'stage': 'Complete',
-                             'movie': movie}
+                             'movie': movie, 'rgb': rgb, 'depth': depth,
+                             'zip_name': zip_name, 'movie_name': skel_name,
+                             'rgb_name': rgb_name, 'depth_name': depth_name}
+        # Outcome goes on the stored recording, not just in memory. _jobs is
+        # wiped on restart, so without this a batch that failed weeks ago is
+        # invisible — which is exactly how the 2026-09-24 failures went
+        # unnoticed until someone went looking.
+        if save_path:
+            _update_upload_meta(save_path, status='done', error=None)
 
     except Exception as exc:
         with _lock:
@@ -788,6 +1428,8 @@ def _run_job(job_id: str, zip_bytes: bytes, tracker: str,
             _jobs[job_id] = {'status': 'error', 'result': None, 'error': str(exc),
                              'percent': prev.get('percent', 0),
                              'stage': prev.get('stage', '')}
+        if save_path:
+            _update_upload_meta(save_path, status='error', error=str(exc)[:500])
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

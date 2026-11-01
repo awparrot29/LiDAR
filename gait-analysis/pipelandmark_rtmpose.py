@@ -114,6 +114,7 @@ def extract_all_landmarks(folder):
     tracker = _make_tracker()
     cap = cv2.VideoCapture(video_path)
     frame_i = 0
+    n_undetected = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -139,6 +140,8 @@ def extract_all_landmarks(folder):
             # Pick the most confident person (handles multi-person scenes)
             best = int(np.argmax(np.asarray(scores).mean(axis=1)))
             kps = np.asarray(keypoints)[best]
+        if kps is None:
+            n_undetected += 1
 
         # Load depth/confidence once per frame, pairing them by filename
         fname = depth_files[frame_i]
@@ -197,6 +200,16 @@ def extract_all_landmarks(folder):
         frame_i += 1
 
     cap.release()
+
+    # Same quality summary the motion-analysis pipelines print, so a tracker
+    # dropout is visible instead of hidden behind held positions.
+    if n_undetected:
+        print(f"Warning: no person detected on {n_undetected}/{frame_i} frames "
+              f"(held previous position)")
+    n_samples = frame_i * len(landmark_map)
+    n_usable = sum(sum(1 for v in ok_z[n] if v) for n in landmark_map)
+    print(f"Usable depth: {n_usable}/{n_samples} samples "
+          f"({100.0 * n_usable / max(n_samples, 1):.1f}%)")
 
     # Second pass: average each joint's depth over the neighbouring frames, then
     # project. x and y are derived from the smoothed depth so all three stay

@@ -1,0 +1,23 @@
+# Packages for analyze_recording.py, the offline analysis program.
+# No web server packages (flask, gunicorn): the CLI does not need them.
+# Versions are pinned to the set this was tested with, so an install made
+# months from now from a wheel folder behaves the same.
+#
+# Python 3.11 (64-bit). mediapipe 0.10.14 has no wheels for Python 3.13+.
+
+numpy==2.4.6
+opencv-python==4.10.0.82
+# mediapipe and rtmlib also install the contrib build, which is the cv2 that
+# actually loads. Pinned so every install uses the same one.
+opencv-contrib-python==5.0.0.93
+# mediapipe 1.x removed the mp.solutions API the pipelines use.
+mediapipe==0.10.14
+matplotlib==3.9.0
+# RTMPose (tests 3.7, 3.8, --tracker rtmpose) on ONNX Runtime.
+rtmlib==0.0.15
+onnxruntime==1.28.0
+# SpinePose (test 3.13 Posture).
+spinepose==2.1.0
+# Static ffmpeg for the H.264 videos.
+imageio==2.37.4
+imageio-ffmpeg==0.6.0

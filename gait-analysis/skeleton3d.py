@@ -16,6 +16,23 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the 3d project
 import cv2
 import numpy as np
 
+# Same naming rules calculateangle.py wrote the CSVs with, so this reader and
+# that writer cannot disagree about where a file is. Loaded by path rather than
+# via sys.path — see the note in calculateangle.py: motion-analysis holds its
+# own background/depthsmooth/sessiongeom/skeleton3d, and putting it on the path
+# shadows this package's copies.
+def _load_csvout():
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        os.pardir, 'motion-analysis', 'csvout.py')
+    spec = importlib.util.spec_from_file_location('csvout', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+csvout = _load_csvout()
+
 # The twelve landmarks calculateangle.py writes a coordinate CSV for
 LANDMARKS = [
     "left shoulder", "right shoulder",
@@ -59,14 +76,21 @@ def bone_color(a, b):
     return SPINE_COLOR
 
 
-def load_landmarks(data_dir):
-    """Load {landmark name: (n_frames, 3) array} from a charts data folder."""
+def load_landmarks(data_dir, test_id=None):
+    """Load {landmark name: (n_frames, 3) array} from a charts data folder.
+
+    csvout writes `time_s,x_m,y_m,z_m`, so skip the header row and take
+    columns 1-3; column 0 is time and is not wanted here. These files carried
+    no header and no time column before 2026-10-04 — an older CSV read through
+    here would come back shifted by one column and short one frame, rather than
+    raising, so regenerate rather than mixing old and new output.
+    """
     out = {}
     for name in LANDMARKS:
-        path = os.path.join(data_dir, f"{name}.csv")
+        path = os.path.join(data_dir, csvout.stem(name, test_id) + ".csv")
         if not os.path.exists(path):
             raise RuntimeError(f"Missing coordinate CSV: {path}")
-        arr = np.loadtxt(path, delimiter=",")
+        arr = np.loadtxt(path, delimiter=",", skiprows=1, usecols=(1, 2, 3))
         if arr.ndim == 1:                    # single-frame session
             arr = arr.reshape(1, 3)
         out[name] = arr

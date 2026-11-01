@@ -233,3 +233,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Model weights for offline use (fill with: python lidar_cli.py --download-models).
+# Too large for GitHub (several files exceed 100 MB); copy the folder across instead.
+models/

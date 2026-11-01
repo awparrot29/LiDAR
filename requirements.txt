@@ -14,3 +14,5 @@ onnxruntime
 # inline in a browser; OpenCV's mp4v output cannot be embedded.
 imageio
 imageio-ffmpeg
+# SpinePose — 37-keypoint model with lumbar/thoracic vertebrae, for 3.13 Posture.
+spinepose
