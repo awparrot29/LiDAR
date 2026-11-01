@@ -205,8 +205,12 @@ TEST_GUIDE = {
         "of each leg; ankle positions show the steps; wrist positions show "
         "arm swing. Recordings are of walks toward or away from the camera, "
         "so walking distance shows up mainly in z_m.",
-        "Walking speed = change in the hips' z_m over time; arm swing = how "
-        "far each wrist moves back and forth relative to its shoulder."),
+        "Walking speed = how far the hips' z_m changes, divided by the time "
+        "taken (use a stretch of steady walking). Steps = the right ankle's "
+        "z_m subtracted from the left ankle's: it changes sign each time the "
+        "other foot moves in front, so the time between sign changes is the "
+        "step time. Arm swing = how far each wrist's z_m moves back and forth "
+        "relative to the same side's shoulder."),
     "posture": (
         "Posture: each spinal angle is 180 degrees when that section of the "
         "back is straight; a smaller angle means that section is more bent. "
@@ -677,6 +681,62 @@ def csv_stats(path):
     return rows, header, empty
 
 
+def session_geometry(session_dir):
+    """Camera geometry (frame size and lens calibration) of a recording, as
+    the pipelines use it, or None if it cannot be read."""
+    sys.path.insert(0, MOTION_DIR)
+    try:
+        import sessiongeom
+        return sessiongeom.frame_geometry(session_dir)
+    except Exception:
+        return None
+    finally:
+        sys.path.remove(MOTION_DIR)
+
+
+def edge_spans(path, geom):
+    """Frames where a position sits on the edge of the picture.
+
+    The pipelines clamp a point that is outside the image to the nearest
+    edge pixel, so such a point gets a position that is not real. Projecting
+    each 3D position back into the image finds those frames. Returns
+    (count, [(start_s, end_s), ...]) or None when geometry is unknown.
+    """
+    if not geom:
+        return None
+    fx, fy, cx, cy = geom["fx"], geom["fy"], geom["cx"], geom["cy"]
+    w, h = geom["width"], geom["height"]
+    times = []
+    with open(path, newline="", encoding="utf-8") as fh:
+        rd = csv.reader(fh)
+        next(rd, None)
+        for row in rd:
+            try:
+                t, x, y, z = (float(v) for v in row[:4])
+            except ValueError:
+                continue
+            if not z > 0:
+                continue
+            col, r = x * fx / z + cx, y * fy / z + cy
+            if col <= 0.5 or col >= w - 1.5 or r <= 0.5 or r >= h - 1.5:
+                times.append(t)
+    spans = []
+    for t in times:
+        if spans and t - spans[-1][1] <= 2.5 / FPS:
+            spans[-1][1] = t
+        else:
+            spans.append([t, t])
+    return len(times), [(a, b) for a, b in spans]
+
+
+def fmt_spans(spans, limit=3):
+    parts = [f"{a:.1f}-{b:.1f} s" if b - a >= 0.05 else f"{a:.1f} s"
+             for a, b in spans[:limit]]
+    if len(spans) > limit:
+        parts.append(f"and {len(spans) - limit} more")
+    return ", ".join(parts)
+
+
 def describe_csv(fname, test_id, landmarks, angle_defs):
     """(type, name, description) for one CSV, from its file name."""
     stem = fname[:-4]
@@ -804,10 +864,16 @@ def build_readme(info, csv_files, videos, graphs, quality):
         landmarks, angle_defs, prof = [], {}, {}
 
     rows_info = []
+    edge_points = []          # (name, frames at edge, spans)
     for fname, path in csv_files:
         typ, name, desc = describe_csv(fname, test_id, landmarks, angle_defs)
         rows, header, empty = csv_stats(path)
-        rows_info.append((typ, fname, desc, rows, empty))
+        edge = None
+        if typ == "point":
+            edge = edge_spans(path, info.get("geometry"))
+            if edge and edge[0]:
+                edge_points.append((name, edge[0], edge[1]))
+        rows_info.append((typ, fname, desc, rows, empty, edge))
     n_angles = sum(1 for r in rows_info if r[0] == "angle")
     n_points = len(rows_info) - n_angles
     frames = info["frames"]
@@ -873,6 +939,20 @@ def build_readme(info, csv_files, videos, graphs, quality):
     # ---- Data quality ------------------------------------------------------
     w(heading("DATA QUALITY"))
     summary, raw = quality_summary(quality, kind)
+    if edge_points:
+        edge_points.sort(key=lambda e: -e[1])
+        parts = [f"{n} ({fmt_spans(sp, 2)})" for n, _, sp in edge_points[:6]]
+        more = (f", and {len(edge_points) - 6} more"
+                if len(edge_points) > 6 else "")
+        summary.append(
+            "Some points went outside the picture: " + "; ".join(parts) + more
+            + ". In those frames the position is pinned to the edge of the "
+            "picture, so it is NOT the real position - leave those times out. "
+            "Angles that use those points are unreliable at the same times. "
+            "Exact counts are under ALL FILES.")
+    elif info.get("geometry"):
+        summary.append("Every point stayed inside the picture for the whole "
+                       "recording.")
     if summary:
         w("From the analysis of this recording:")
         w("")
@@ -950,11 +1030,14 @@ def build_readme(info, csv_files, videos, graphs, quality):
     if videos:
         w(heading("VIDEOS"))
         vdesc = {
-            "skeleton": "Stick figure drawn from the position files. Left "
-                        "panel: the front view, as the camera saw it. Right "
-                        "panel: a side view, turned 90 degrees, which shows "
-                        "the depth (z_m). If the stick figure does not match "
-                        "the person, the numbers are not reliable.",
+            "skeleton": "Stick figure drawn from the position files. "
+                        + ("Left panel: a three-quarter view (from in front, "
+                           "a little to the side). " if kind == "torso" else
+                           "Left panel: the front view, as the camera saw "
+                           "it. ")
+                        + "Right panel: a side view, turned 90 degrees, which "
+                        "shows the depth (z_m). If the stick figure does not "
+                        "match the person, the numbers are not reliable.",
             "rgb": "The original camera video. PRIVACY: it shows the "
                    "participant, including their face. Handle it as "
                    "identifiable patient data.",
@@ -1003,6 +1086,10 @@ def build_readme(info, csv_files, videos, graphs, quality):
         "best guess.",
         "Left and right labels can occasionally swap, for example when the "
         "person turns around. Check the skeleton video.",
+        "If a point goes outside the picture (for example the feet when "
+        "someone walks close to the camera), the pose model still gives a "
+        "position, but it is pinned to the edge of the picture and is not "
+        "real. DATA QUALITY and ALL FILES list when this happened.",
         "The image is small (192 x 256 pixels), so very small movements "
         "(a few millimetres) are near the limit of what can be measured.",
         "The LiDAR works up to about 5 m from the camera; the closer, the "
@@ -1032,9 +1119,13 @@ def build_readme(info, csv_files, videos, graphs, quality):
         w("")
         w(label + ":")
         w("")
-        for _, fname, desc, rows, empty in items:
+        for _, fname, desc, rows, empty, edge in items:
+            extra = ""
+            if edge and edge[0]:
+                extra = (f" Outside the picture (not real): {edge[0]} rows, "
+                         f"{fmt_spans(edge[1])}.")
             w(fname)
-            w(para(f"{desc} No data: {empty} of {rows} rows.", 4))
+            w(para(f"{desc} No data: {empty} of {rows} rows.{extra}", 4))
     if videos:
         w("")
         w("Videos: " + ", ".join(n for _, n in videos))
@@ -1278,6 +1369,7 @@ def analyse(args):
 
         frames = csv_stats(csv_files[0][1])[0]
         info = {
+            "geometry": session_geometry(os.path.join(work, session)),
             "kind": kind, "auto": auto, "test_id": test_id or None,
             "model_desc": model_desc,
             "input_name": os.path.basename(src.rstrip("\\/")),
