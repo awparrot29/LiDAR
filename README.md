@@ -5,6 +5,11 @@ iPhones/iPads, combining 3D pose estimation with depth data. It handles two kind
 of recording: a **torso** recording of someone walking, and a close-up **hand**
 recording of finger movement. See [Torso vs Hand](#torso-vs-hand).
 
+> **Running without internet access (for example, inside a hospital firewall)?**
+> Use [`lidar_cli.py`](OFFLINE_CLI.md). It covers every MDS-UPDRS test on the
+> website (`--test 3.10`, `--test 3.4a`, ...) and adds a README explaining each
+> output file. See [OFFLINE_CLI.md](OFFLINE_CLI.md) for the one-time setup.
+
 ---
 
 # Quick Start &mdash; process a recording
